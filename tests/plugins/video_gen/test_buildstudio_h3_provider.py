@@ -24,7 +24,11 @@ def _fake_openai(captured: dict):
                 id="video-1",
                 status="completed",
                 error=None,
-                data=[{"url": "https://buildstudio-there.com/api/v1/videos/jobs/video-1/content"}],
+                data=[
+                    {
+                        "url": "https://buildstudio-there.com/api/v1/videos/jobs/video-1/content"
+                    }
+                ],
             )
 
         def retrieve(self, video_id):
@@ -59,7 +63,10 @@ def _mock_video_download(captured: dict):
 def test_local_provider_uses_coordinator_and_landscape_profile():
     captured = {}
     provider = h3_plugin.BuildStudioH3VideoGenProvider()
-    with patch.dict("sys.modules", {"openai": _fake_openai(captured)}), _mock_video_download(captured):
+    with (
+        patch.dict("sys.modules", {"openai": _fake_openai(captured)}),
+        _mock_video_download(captured),
+    ):
         result = provider.generate("robot welding with workshop ambience", duration=5)
 
     assert result["success"] is True
@@ -74,6 +81,8 @@ def test_local_provider_uses_coordinator_and_landscape_profile():
 def test_portrait_profile_and_limits_are_enforced():
     provider = h3_plugin.BuildStudioH3VideoGenProvider()
     assert provider._size("720p", "9:16") == "480x864"
+    assert provider._size("2560x1440", "16:9") == "2560x1440"
+    assert provider.capabilities()["supports_upscale"] is True
     result = provider.generate("too long", duration=6)
     assert result["success"] is False
     assert result["error_type"] == "invalid_request"

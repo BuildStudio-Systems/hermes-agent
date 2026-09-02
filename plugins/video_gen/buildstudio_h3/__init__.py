@@ -40,13 +40,19 @@ class BuildStudioH3VideoGenProvider(OpenAICompatibleVideoGenProvider):
         return {
             "modalities": ["text"],
             "aspect_ratios": ["16:9", "9:16", "1:1"],
-            "resolutions": ["864x480", "480x864", "640x640"],
+            "resolutions": [
+                "864x480",
+                "480x864",
+                "640x640",
+                "2560x1440",
+                "1440x2560",
+            ],
             "max_duration": 5,
             "min_duration": 2,
             "supports_audio": True,
             "supports_negative_prompt": False,
             "supports_seed": True,
-            "supports_upscale": False,
+            "supports_upscale": True,
             "max_reference_images": 0,
         }
 
@@ -60,7 +66,15 @@ class BuildStudioH3VideoGenProvider(OpenAICompatibleVideoGenProvider):
 
     @staticmethod
     def _size(resolution: str, aspect_ratio: str) -> str:
-        allowed = {"864x480", "480x864", "640x640", "640x384", "384x640"}
+        allowed = {
+            "864x480",
+            "480x864",
+            "640x640",
+            "640x384",
+            "384x640",
+            "2560x1440",
+            "1440x2560",
+        }
         if resolution in allowed:
             return resolution
         return {
