@@ -1,0 +1,7 @@
+name: buildstudio_h3
+version: 1.0.0
+description: "BuildStudio local distributed MiniMax H3 text-to-video with native audio."
+author: BuildStudio Systems
+kind: backend
+requires_env:
+  - VIDEO_COORDINATOR_API_KEY
