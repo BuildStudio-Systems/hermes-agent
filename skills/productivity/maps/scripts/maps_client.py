@@ -20,6 +20,7 @@ import argparse
 import json
 import math
 import os
+import socket
 import sys
 import time
 import urllib.error
@@ -365,6 +366,28 @@ def _safe_google_error(value):
     return message
 
 
+def _google_urlopen(request, timeout):
+    """Open Google over IPv4 to avoid this host's unrouted IPv6 DNS answers.
+
+    The AI server resolves Google AAAA records first but has no working IPv6
+    route. urllib otherwise waits for every IPv6 attempt before trying IPv4,
+    while curl succeeds immediately. Each maps CLI invocation is a dedicated
+    process, so temporarily narrowing its resolver is isolated and safe.
+    """
+    original_getaddrinfo = socket.getaddrinfo
+
+    def ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        results = original_getaddrinfo(host, port, family, type, proto, flags)
+        ipv4_results = [item for item in results if item[0] == socket.AF_INET]
+        return ipv4_results or results
+
+    socket.getaddrinfo = ipv4_getaddrinfo
+    try:
+        return urllib.request.urlopen(request, timeout=timeout)
+    finally:
+        socket.getaddrinfo = original_getaddrinfo
+
+
 def google_json_request(url, payload=None, params=None, field_mask=None,
                         retries=MAX_RETRIES):
     """Call a Google Maps JSON endpoint without logging credentials.
@@ -402,7 +425,7 @@ def google_json_request(url, payload=None, params=None, field_mask=None,
             method="POST" if payload is not None else "GET",
         )
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
+            with _google_urlopen(request, timeout=20) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.reason
