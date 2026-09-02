@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 maps_client.py - CLI tool for maps, geocoding, routing, POI search, and more.
-Uses only Python stdlib. Data from OpenStreetMap/Nominatim, Overpass API, OSRM,
-and TimeAPI.io.
+Uses only Python stdlib. Google Maps Platform can be selected for production
+place search, geocoding, and routing; OpenStreetMap services remain available
+as a keyless fallback.
 
 Commands:
   search     - Geocode a place name to coordinates
@@ -18,6 +19,7 @@ Commands:
 import argparse
 import json
 import math
+import os
 import sys
 import time
 import urllib.error
@@ -30,6 +32,26 @@ import urllib.request
 
 USER_AGENT = "HermesAgent/1.0 (contact: hermes@agent.ai)"
 DATA_SOURCE = "OpenStreetMap/Nominatim"
+GOOGLE_DATA_SOURCE = "Google Maps Platform"
+
+MAPS_PROVIDER = os.environ.get("MAPS_PROVIDER", "osm").strip().lower()
+MAPS_FALLBACK_PROVIDER = os.environ.get(
+    "MAPS_FALLBACK_PROVIDER", "osm"
+).strip().lower()
+GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
+GOOGLE_MAPS_REGION = os.environ.get("GOOGLE_MAPS_REGION", "JP").strip().upper()
+GOOGLE_MAPS_LANGUAGE = os.environ.get(
+    "GOOGLE_MAPS_LANGUAGE", "zh-CN"
+).strip()
+
+GOOGLE_PLACES_TEXT_SEARCH = (
+    "https://places.googleapis.com/v1/places:searchText"
+)
+GOOGLE_PLACES_NEARBY_SEARCH = (
+    "https://places.googleapis.com/v1/places:searchNearby"
+)
+GOOGLE_GEOCODING = "https://maps.googleapis.com/maps/api/geocode/json"
+GOOGLE_ROUTES = "https://routes.googleapis.com/directions/v2:computeRoutes"
 
 NOMINATIM_SEARCH  = "https://nominatim.openstreetmap.org/search"
 NOMINATIM_REVERSE = "https://nominatim.openstreetmap.org/reverse"
@@ -122,6 +144,58 @@ RELIGION_FILTER = {
 }
 
 VALID_CATEGORIES = sorted(CATEGORY_TAGS.keys())
+
+# Places API (New) primary types matching the public CLI vocabulary. Keeping
+# this mapping explicit prevents arbitrary model text from becoming an
+# unsupported includedType value.
+GOOGLE_PLACE_TYPES = {
+    "restaurant": "restaurant",
+    "cafe": "cafe",
+    "bar": "bar",
+    "bakery": "bakery",
+    "convenience_store": "convenience_store",
+    "hospital": "hospital",
+    "pharmacy": "pharmacy",
+    "dentist": "dentist",
+    "doctor": "doctor",
+    "veterinary": "veterinary_care",
+    "hotel": "hotel",
+    "guest_house": "guest_house",
+    "camp_site": "campground",
+    "supermarket": "supermarket",
+    "bookshop": "book_store",
+    "laundry": "laundry",
+    "atm": "atm",
+    "bank": "bank",
+    "gas_station": "gas_station",
+    "parking": "parking",
+    "airport": "airport",
+    "train_station": "train_station",
+    "bus_stop": "bus_stop",
+    "taxi": "taxi_stand",
+    "car_wash": "car_wash",
+    "car_rental": "car_rental",
+    "bicycle_rental": "bicycle_rental",
+    "museum": "museum",
+    "cinema": "movie_theater",
+    "theatre": "performing_arts_theater",
+    "nightclub": "night_club",
+    "zoo": "zoo",
+    "school": "school",
+    "university": "university",
+    "library": "library",
+    "police": "police",
+    "fire_station": "fire_station",
+    "post_office": "post_office",
+    "church": "church",
+    "mosque": "mosque",
+    "synagogue": "synagogue",
+    "park": "park",
+    "gym": "gym",
+    "swimming_pool": "swimming_pool",
+    "playground": "playground",
+    "stadium": "stadium",
+}
 
 
 def _tags_for(category):
@@ -269,6 +343,265 @@ def http_post(url, data_str, retries=MAX_RETRIES):
     error_exit(f"POST failed after {retries} attempts. Last error: {last_error}")
 
 
+# ---------------------------------------------------------------------------
+# Google Maps Platform helpers
+# ---------------------------------------------------------------------------
+
+def google_is_primary():
+    """Return whether Google is configured as the active map provider."""
+    return MAPS_PROVIDER in {"google", "hybrid"} and bool(GOOGLE_MAPS_API_KEY)
+
+
+def osm_fallback_enabled():
+    """Return whether a failed/unavailable Google request may use OSM."""
+    return MAPS_FALLBACK_PROVIDER == "osm"
+
+
+def _safe_google_error(value):
+    """Remove the API key if an upstream error unexpectedly echoes it."""
+    message = str(value or "unknown Google Maps error")
+    if GOOGLE_MAPS_API_KEY:
+        message = message.replace(GOOGLE_MAPS_API_KEY, "[redacted]")
+    return message
+
+
+def google_json_request(url, payload=None, params=None, field_mask=None,
+                        retries=MAX_RETRIES):
+    """Call a Google Maps JSON endpoint without logging credentials.
+
+    Places and Routes accept the key in a header. The legacy Geocoding API
+    requires a query parameter; errors deliberately report only the endpoint
+    hostname/status and never the request URL.
+    """
+    if not GOOGLE_MAPS_API_KEY:
+        raise RuntimeError("GOOGLE_MAPS_API_KEY is not configured")
+
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+    }
+    request_url = url
+    encoded = None
+    if payload is not None:
+        encoded = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+        headers["X-Goog-Api-Key"] = GOOGLE_MAPS_API_KEY
+        if field_mask:
+            headers["X-Goog-FieldMask"] = field_mask
+    else:
+        query = dict(params or {})
+        query["key"] = GOOGLE_MAPS_API_KEY
+        request_url = url + "?" + urllib.parse.urlencode(query)
+
+    last_error = None
+    for attempt in range(1, retries + 1):
+        request = urllib.request.Request(
+            request_url,
+            data=encoded,
+            headers=headers,
+            method="POST" if payload is not None else "GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.reason
+            try:
+                error_body = json.loads(exc.read().decode("utf-8"))
+                detail = (
+                    error_body.get("error", {}).get("message")
+                    or error_body.get("error_message")
+                    or detail
+                )
+            except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+                pass
+            last_error = (
+                f"Google Maps API HTTP {exc.code}: "
+                f"{_safe_google_error(detail)}"
+            )
+            if exc.code in {429, 500, 502, 503, 504}:
+                time.sleep(RETRY_DELAY * attempt)
+                continue
+            raise RuntimeError(last_error) from exc
+        except urllib.error.URLError as exc:
+            last_error = f"Google Maps network error: {exc.reason}"
+            time.sleep(RETRY_DELAY * attempt)
+        except json.JSONDecodeError as exc:
+            last_error = f"Google Maps returned invalid JSON: {exc}"
+            time.sleep(RETRY_DELAY * attempt)
+
+    raise RuntimeError(
+        f"Google Maps request failed after {retries} attempts: "
+        f"{_safe_google_error(last_error)}"
+    )
+
+
+def _google_place_name(place):
+    display_name = place.get("displayName", {})
+    if isinstance(display_name, dict):
+        return display_name.get("text", "")
+    return str(display_name or "")
+
+
+def google_place_to_result(place, ref_lat=None, ref_lon=None):
+    """Normalize a Places API (New) place to the maps CLI schema."""
+    location = place.get("location", {})
+    lat = location.get("latitude")
+    lon = location.get("longitude")
+    result = {
+        "name": _google_place_name(place),
+        "display_name": place.get("formattedAddress", ""),
+        "address": place.get("formattedAddress", ""),
+        "lat": lat,
+        "lon": lon,
+        "place_id": place.get("id", ""),
+        "types": place.get("types", []),
+        "maps_url": place.get("googleMapsUri", ""),
+    }
+    if lat is not None and lon is not None and ref_lat is not None and ref_lon is not None:
+        result["distance_m"] = round(
+            haversine_m(ref_lat, ref_lon, lat, lon), 1
+        )
+        result["directions_url"] = (
+            "https://www.google.com/maps/dir/?api=1"
+            f"&origin={ref_lat},{ref_lon}"
+            f"&destination={lat},{lon}"
+        )
+    return result
+
+
+def google_places_text_search(query, limit=5):
+    limit = max(1, min(int(limit), 20))
+    payload = {
+        "textQuery": query,
+        "languageCode": GOOGLE_MAPS_LANGUAGE,
+        "regionCode": GOOGLE_MAPS_REGION,
+        "maxResultCount": limit,
+    }
+    field_mask = (
+        "places.id,places.displayName,places.formattedAddress,"
+        "places.location,places.googleMapsUri,places.types"
+    )
+    data = google_json_request(
+        GOOGLE_PLACES_TEXT_SEARCH,
+        payload=payload,
+        field_mask=field_mask,
+    )
+    return data.get("places", [])
+
+
+def google_places_nearby(lat, lon, categories, radius, limit):
+    included_types = list(dict.fromkeys(
+        GOOGLE_PLACE_TYPES[category] for category in categories
+    ))
+    payload = {
+        "includedTypes": included_types,
+        "maxResultCount": max(1, min(int(limit), 20)),
+        "rankPreference": "DISTANCE",
+        "languageCode": GOOGLE_MAPS_LANGUAGE,
+        "regionCode": GOOGLE_MAPS_REGION,
+        "locationRestriction": {
+            "circle": {
+                "center": {"latitude": lat, "longitude": lon},
+                "radius": min(float(radius), 50000.0),
+            }
+        },
+    }
+    field_mask = (
+        "places.id,places.displayName,places.formattedAddress,"
+        "places.location,places.googleMapsUri,places.types"
+    )
+    data = google_json_request(
+        GOOGLE_PLACES_NEARBY_SEARCH,
+        payload=payload,
+        field_mask=field_mask,
+    )
+    return data.get("places", [])
+
+
+def google_geocode_single(query):
+    places = google_places_text_search(query, limit=1)
+    if not places:
+        raise RuntimeError(f"Google Maps could not geocode: {query}")
+    place = places[0]
+    location = place.get("location", {})
+    lat = location.get("latitude")
+    lon = location.get("longitude")
+    if lat is None or lon is None:
+        raise RuntimeError(f"Google Maps returned no coordinates for: {query}")
+    name = place.get("formattedAddress") or _google_place_name(place) or query
+    return float(lat), float(lon), name
+
+
+def google_reverse_geocode(lat, lon):
+    data = google_json_request(
+        GOOGLE_GEOCODING,
+        params={
+            "latlng": f"{lat},{lon}",
+            "language": GOOGLE_MAPS_LANGUAGE,
+            "region": GOOGLE_MAPS_REGION.lower(),
+        },
+    )
+    status = data.get("status")
+    if status not in {"OK", "ZERO_RESULTS"}:
+        raise RuntimeError(
+            "Google Geocoding failed: "
+            f"{_safe_google_error(data.get('error_message') or status)}"
+        )
+    results = data.get("results", [])
+    return results[0] if results else None
+
+
+def _google_duration_seconds(value):
+    try:
+        text = str(value)
+        return float(text[:-1] if text.endswith("s") else text)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def google_compute_route(o_lat, o_lon, d_lat, d_lon, mode, include_steps=False):
+    travel_modes = {
+        "driving": "DRIVE",
+        "walking": "WALK",
+        "cycling": "BICYCLE",
+    }
+    payload = {
+        "origin": {
+            "location": {
+                "latLng": {"latitude": o_lat, "longitude": o_lon}
+            }
+        },
+        "destination": {
+            "location": {
+                "latLng": {"latitude": d_lat, "longitude": d_lon}
+            }
+        },
+        "travelMode": travel_modes[mode],
+        "languageCode": GOOGLE_MAPS_LANGUAGE,
+        "units": "METRIC",
+    }
+    if mode == "driving":
+        payload["routingPreference"] = "TRAFFIC_AWARE"
+
+    fields = ["routes.distanceMeters", "routes.duration"]
+    if include_steps:
+        fields.extend([
+            "routes.legs.steps.distanceMeters",
+            "routes.legs.steps.staticDuration",
+            "routes.legs.steps.navigationInstruction",
+        ])
+    data = google_json_request(
+        GOOGLE_ROUTES,
+        payload=payload,
+        field_mask=",".join(fields),
+    )
+    routes = data.get("routes", [])
+    if not routes:
+        raise RuntimeError("Google Routes returned no route")
+    return routes[0]
+
+
 def overpass_query(query):
     """POST an Overpass QL query, trying each URL in OVERPASS_URLS in turn.
 
@@ -342,6 +675,13 @@ def geocode_single(query):
     Geocode a query and return (lat, lon, display_name).
     Exits with error if nothing found.
     """
+    if google_is_primary():
+        try:
+            return google_geocode_single(query)
+        except RuntimeError as exc:
+            if not osm_fallback_enabled():
+                error_exit(str(exc))
+
     results = nominatim_search(query, limit=1)
     if not results:
         error_exit(f"Could not geocode: {query}")
@@ -501,6 +841,22 @@ def parse_overpass_elements(elements, ref_lat=None, ref_lon=None):
 def cmd_search(args):
     """Geocode a place name and return top results."""
     query = " ".join(args.query)
+
+    if google_is_primary():
+        try:
+            raw_places = google_places_text_search(query, limit=5)
+            results = [google_place_to_result(item) for item in raw_places]
+            print_json({
+                "query": query,
+                "results": results,
+                "count": len(results),
+                "data_source": GOOGLE_DATA_SOURCE,
+            })
+            return
+        except RuntimeError as exc:
+            if not osm_fallback_enabled():
+                error_exit(str(exc))
+
     raw   = nominatim_search(query, limit=5)
 
     if not raw:
@@ -557,6 +913,56 @@ def cmd_reverse(args):
         error_exit("Latitude must be between -90 and 90.")
     if not (-180 <= lon <= 180):
         error_exit("Longitude must be between -180 and 180.")
+
+    if google_is_primary():
+        try:
+            google_result = google_reverse_geocode(lat, lon)
+            if google_result:
+                components = {}
+                for component in google_result.get("address_components", []):
+                    for component_type in component.get("types", []):
+                        components.setdefault(
+                            component_type, component.get("long_name", "")
+                        )
+                print_json({
+                    "lat": lat,
+                    "lon": lon,
+                    "display_name": google_result.get("formatted_address", ""),
+                    "address": {
+                        "house_number": components.get("street_number", ""),
+                        "road": components.get("route", ""),
+                        "neighbourhood": components.get("neighborhood", ""),
+                        "suburb": components.get("sublocality", ""),
+                        "city": (
+                            components.get("locality")
+                            or components.get("postal_town", "")
+                        ),
+                        "county": components.get(
+                            "administrative_area_level_2", ""
+                        ),
+                        "state": components.get(
+                            "administrative_area_level_1", ""
+                        ),
+                        "postcode": components.get("postal_code", ""),
+                        "country": components.get("country", ""),
+                        "country_code": next(
+                            (
+                                item.get("short_name", "").lower()
+                                for item in google_result.get(
+                                    "address_components", []
+                                )
+                                if "country" in item.get("types", [])
+                            ),
+                            "",
+                        ),
+                    },
+                    "place_id": google_result.get("place_id", ""),
+                    "data_source": GOOGLE_DATA_SOURCE,
+                })
+                return
+        except RuntimeError as exc:
+            if not osm_fallback_enabled():
+                error_exit(str(exc))
 
     data = nominatim_reverse(lat, lon)
 
@@ -643,6 +1049,40 @@ def cmd_nearby(args):
     if limit <= 0:
         error_exit("Limit must be a positive integer.")
 
+    if google_is_primary():
+        try:
+            raw_places = google_places_nearby(
+                lat, lon, categories, radius, limit
+            )
+            places = []
+            for item in raw_places:
+                place = google_place_to_result(
+                    item, ref_lat=lat, ref_lon=lon
+                )
+                place_types = set(place.get("types", []))
+                place["category"] = next(
+                    (
+                        category for category in categories
+                        if GOOGLE_PLACE_TYPES[category] in place_types
+                    ),
+                    categories[0],
+                )
+                places.append(place)
+            places.sort(key=lambda item: item.get("distance_m", float("inf")))
+            print_json({
+                "center_lat": lat,
+                "center_lon": lon,
+                "categories": categories,
+                "radius_m": radius,
+                "count": len(places),
+                "results": places,
+                "data_source": GOOGLE_DATA_SOURCE,
+            })
+            return
+        except RuntimeError as exc:
+            if not osm_fallback_enabled():
+                error_exit(str(exc))
+
     # Query each category against the Overpass fallback chain, merge results,
     # dedupe by OSM identity so POIs tagged under multiple categories don't
     # appear twice.
@@ -695,6 +1135,42 @@ def cmd_distance(args):
     # Geocode origin and destination
     o_lat, o_lon, o_name = geocode_single(origin_query)
     d_lat, d_lon, d_name = geocode_single(destination_query)
+
+    if google_is_primary():
+        try:
+            google_route = google_compute_route(
+                o_lat, o_lon, d_lat, d_lon, mode
+            )
+            distance_m = float(google_route.get("distanceMeters", 0))
+            duration_s = _google_duration_seconds(
+                google_route.get("duration", "0s")
+            )
+            straight_m = haversine_m(o_lat, o_lon, d_lat, d_lon)
+            print_json({
+                "origin": {
+                    "query": origin_query,
+                    "display_name": o_name,
+                    "lat": o_lat,
+                    "lon": o_lon,
+                },
+                "destination": {
+                    "query": destination_query,
+                    "display_name": d_name,
+                    "lat": d_lat,
+                    "lon": d_lon,
+                },
+                "mode": mode,
+                "distance_km": round(distance_m / 1000, 3),
+                "distance_m": round(distance_m, 1),
+                "duration_minutes": round(duration_s / 60, 2),
+                "duration_seconds": round(duration_s, 1),
+                "straight_line_km": round(straight_m / 1000, 3),
+                "data_source": GOOGLE_DATA_SOURCE,
+            })
+            return
+        except RuntimeError as exc:
+            if not osm_fallback_enabled():
+                error_exit(str(exc))
 
     profile = OSRM_PROFILES[mode]
     url = (
@@ -782,6 +1258,60 @@ def cmd_directions(args):
     # Geocode origin and destination
     o_lat, o_lon, o_name = geocode_single(origin_query)
     d_lat, d_lon, d_name = geocode_single(destination_query)
+
+    if google_is_primary():
+        try:
+            google_route = google_compute_route(
+                o_lat, o_lon, d_lat, d_lon, mode, include_steps=True
+            )
+            distance_m = float(google_route.get("distanceMeters", 0))
+            duration_s = _google_duration_seconds(
+                google_route.get("duration", "0s")
+            )
+            steps = []
+            for leg in google_route.get("legs", []):
+                for raw_step in leg.get("steps", []):
+                    navigation = raw_step.get("navigationInstruction", {})
+                    step_distance = float(raw_step.get("distanceMeters", 0))
+                    step_duration = _google_duration_seconds(
+                        raw_step.get("staticDuration", "0s")
+                    )
+                    steps.append({
+                        "step": len(steps) + 1,
+                        "instruction": navigation.get("instructions", "Continue"),
+                        "distance": _format_distance(step_distance),
+                        "distance_m": round(step_distance, 1),
+                        "duration": _format_duration(step_duration),
+                        "duration_s": round(step_duration, 1),
+                        "road_name": "",
+                        "maneuver": navigation.get("maneuver", ""),
+                    })
+            print_json({
+                "origin": {
+                    "query": origin_query,
+                    "display_name": o_name,
+                    "lat": o_lat,
+                    "lon": o_lon,
+                },
+                "destination": {
+                    "query": destination_query,
+                    "display_name": d_name,
+                    "lat": d_lat,
+                    "lon": d_lon,
+                },
+                "mode": mode,
+                "total_distance": _format_distance(distance_m),
+                "total_distance_m": round(distance_m, 1),
+                "total_duration": _format_duration(duration_s),
+                "total_duration_s": round(duration_s, 1),
+                "steps": steps,
+                "step_count": len(steps),
+                "data_source": GOOGLE_DATA_SOURCE,
+            })
+            return
+        except RuntimeError as exc:
+            if not osm_fallback_enabled():
+                error_exit(str(exc))
 
     profile = OSRM_PROFILES[mode]
     url = (

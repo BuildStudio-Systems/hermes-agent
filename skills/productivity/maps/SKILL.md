@@ -1,7 +1,7 @@
 ---
 name: maps
-description: "Geocode, POIs, routes, timezones via OpenStreetMap/OSRM."
-version: 1.2.0
+description: "Geocode, POIs, and routes via Google Maps with an OpenStreetMap fallback."
+version: 1.3.0
 author: Mibayy
 license: MIT
 platforms: [linux, macos, windows]
@@ -15,10 +15,12 @@ metadata:
 
 # Maps Skill
 
-Location intelligence using free, open data sources. 8 commands, 44 POI
-categories, zero dependencies (Python stdlib only), no API key required.
+Location intelligence using Google Maps Platform in BuildStudio production,
+with free OpenStreetMap services as the automatic fallback. 8 commands, 46
+POI categories, and zero Python package dependencies.
 
-Data sources: OpenStreetMap/Nominatim, Overpass API, OSRM, TimeAPI.io.
+Primary production sources: Places API (New), Geocoding API, and Routes API.
+Fallback sources: OpenStreetMap/Nominatim, Overpass API, OSRM, and TimeAPI.io.
 
 This skill supersedes the old `find-nearby` skill — all of find-nearby's
 functionality is covered by the `nearby` command below, with the same
@@ -41,6 +43,21 @@ Python 3.8+ (stdlib only — no pip installs needed).
 
 Script path: `~/.hermes/skills/maps/scripts/maps_client.py`
 
+BuildStudio production injects these variables from the protected
+`~/BuildStudio-There/shared/maps.env` file:
+
+```bash
+MAPS_PROVIDER=google
+GOOGLE_MAPS_API_KEY=<server-only-key>
+GOOGLE_MAPS_REGION=JP
+GOOGLE_MAPS_LANGUAGE=zh-CN
+MAPS_FALLBACK_PROVIDER=osm
+```
+
+Never place the real key in this skill, a command example, logs, or Git. If
+Google is unavailable, the command automatically uses OSM when the fallback is
+set to `osm`.
+
 ## Commands
 
 ```bash
@@ -54,7 +71,9 @@ python $MAPS search "Eiffel Tower"
 python $MAPS search "1600 Pennsylvania Ave, Washington DC"
 ```
 
-Returns: lat, lon, display name, type, bounding box, importance score.
+Returns: lat, lon, display name, place types, and a Google Maps link when the
+Google provider is active. The OSM fallback additionally returns its bounding
+box and importance score.
 
 ### reverse — Coordinates to address
 
@@ -176,7 +195,11 @@ current.
 
 ## Pitfalls
 
-- Nominatim ToS: max 1 req/s (handled automatically by the script)
+- Google requests are billable; request only the fields already defined in the
+  script and keep project budgets/quotas enabled.
+- The server API key is restricted to the configured public egress IP. If that
+  IP changes, update the Google Cloud restriction before diagnosing the tool.
+- Nominatim ToS: max 1 req/s (handled automatically by the fallback)
 - `nearby` requires lat/lon OR `--near "<address>"` — one of the two is needed
 - OSRM routing coverage is best for Europe and North America
 - Overpass API can be slow during peak hours; the script automatically
@@ -192,4 +215,7 @@ python ~/.hermes/skills/maps/scripts/maps_client.py search "Statue of Liberty"
 
 python ~/.hermes/skills/maps/scripts/maps_client.py nearby --near "Times Square" --category restaurant --limit 3
 # Should return a list of restaurants within ~500m of Times Square
+
+python ~/.hermes/skills/maps/scripts/maps_client.py nearby --near "西船橋駅" --category restaurant --limit 5
+# In BuildStudio production, data_source should be "Google Maps Platform"
 ```
