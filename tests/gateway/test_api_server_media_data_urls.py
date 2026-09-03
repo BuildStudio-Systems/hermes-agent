@@ -6,13 +6,26 @@ data URLs before crossing the HTTP boundary.
 """
 
 import base64
+import re
 import unittest
+from pathlib import Path
 
 import pytest
 
-pytest.importorskip("aiohttp")
+try:
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+except ImportError:  # api_server is an optional messaging dependency
+    web = None
+    TestClient = TestServer = None
 
-from gateway.platforms.api_server import _resolve_media_to_data_urls  # noqa: E402
+from gateway.chat_file_artifacts import ChatFileArtifactStore  # noqa: E402
+from gateway.config import PlatformConfig  # noqa: E402
+from gateway.platforms.api_server import (  # noqa: E402
+    APIServerAdapter,
+    _StreamingMediaResolver,
+    _resolve_media_to_data_urls,
+)
 
 # 1x1 transparent PNG
 _PNG_BYTES = base64.b64decode(
@@ -49,6 +62,87 @@ class TestResolveMediaToDataUrls(unittest.TestCase):
     def test_non_image_left_untouched(self):
         text = "MEDIA:/tmp/archive.zip"
         self.assertEqual(_resolve_media_to_data_urls(text), text)
+
+
+def test_non_image_media_becomes_download_link(tmp_path: Path):
+    source = tmp_path / "result video.mp4"
+    source.write_bytes(b"video")
+    adapter = APIServerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "file_delivery": {
+                    "enabled": True,
+                    "public_base_url": "/api/v1/agent-files",
+                }
+            },
+        )
+    )
+    store = ChatFileArtifactStore(tmp_path / "artifacts.sqlite3")
+    adapter._get_chat_file_store = lambda: store
+
+    output = adapter._resolve_media_for_delivery(f"好了。\nMEDIA:{source}")
+
+    assert "MEDIA:" not in output
+    assert str(source) not in output
+    assert "/api/v1/agent-files/" in output
+    assert "result%20video.mp4" in output
+
+
+def test_streaming_resolver_never_emits_partial_local_path():
+    resolver = _StreamingMediaResolver(
+        lambda text: text.replace("MEDIA:/tmp/result.mp4", "[download](/safe/file)")
+    )
+
+    chunks = []
+    chunks.extend(resolver.feed("Ready. ME"))
+    chunks.extend(resolver.feed("DIA:/tmp/res"))
+    chunks.extend(resolver.feed("ult.mp4"))
+
+    assert "/tmp/" not in "".join(chunks)
+    chunks.extend(resolver.finish())
+    assert "".join(chunks) == "Ready. [download](/safe/file)"
+
+
+@pytest.mark.skipif(web is None, reason="aiohttp is not installed")
+@pytest.mark.asyncio
+async def test_download_endpoint_requires_auth_and_supports_range(tmp_path: Path):
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"0123456789")
+    adapter = APIServerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "key": "test-api-key",
+                "file_delivery": {
+                    "enabled": True,
+                    "public_base_url": "/api/v1/agent-files",
+                },
+            },
+        )
+    )
+    store = ChatFileArtifactStore(tmp_path / "artifacts.sqlite3")
+    adapter._get_chat_file_store = lambda: store
+    link = adapter._resolve_media_for_delivery(f"MEDIA:{source}")
+    artifact_id = re.search(r"/([0-9a-f]{32})/", link).group(1)
+
+    app = web.Application()
+    app.router.add_get("/v1/files/{artifact_id}", adapter._handle_chat_file_download)
+    async with TestClient(TestServer(app)) as client:
+        unauthenticated = await client.get(f"/v1/files/{artifact_id}")
+        assert unauthenticated.status == 401
+
+        response = await client.get(
+            f"/v1/files/{artifact_id}",
+            headers={
+                "Authorization": "Bearer test-api-key",
+                "Range": "bytes=2-5",
+            },
+        )
+        assert response.status == 206
+        assert await response.read() == b"2345"
+        assert response.headers["Accept-Ranges"] == "bytes"
+        assert "attachment" in response.headers["Content-Disposition"]
 
 
 if __name__ == "__main__":

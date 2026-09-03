@@ -620,6 +620,9 @@ async def _handle_runs(
     self._run_approval_sessions[run_id] = approval_session_key
 
     event_cb = self._make_run_event_callback(run_id, loop)
+    media_stream = _api_server._StreamingMediaResolver(
+        self._resolve_media_for_delivery
+    )
 
     def _put_event_if_active(event: Optional[Dict]) -> None:
         """Enqueue only while this run still owns live transport state."""
@@ -633,12 +636,13 @@ async def _handle_runs(
         if run_id not in self._run_streams:
             return
         try:
-            loop.call_soon_threadsafe(_put_event_if_active, {
-                "event": "message.delta",
-                "run_id": run_id,
-                "timestamp": time.time(),
-                "delta": delta,
-            })
+            for content in media_stream.feed(delta):
+                loop.call_soon_threadsafe(_put_event_if_active, {
+                    "event": "message.delta",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "delta": content,
+                })
         except Exception:
             pass
 
@@ -892,7 +896,22 @@ async def _handle_runs(
                     last_event="run.failed",
                 )
             else:
-                final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                for content in media_stream.finish():
+                    _put_event_if_active({
+                        "event": "message.delta",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                        "delta": content,
+                    })
+                raw_final_response = (
+                    result.get("final_response", "")
+                    if isinstance(result, dict)
+                    else ""
+                )
+                with self._profile_scope(request_profile):
+                    final_response = self._resolve_media_for_delivery(
+                        raw_final_response
+                    )
                 # Undelivered steer text (accepted after the final response;
                 # see turn_finalizer) rides on the terminal event/status so
                 # the client can replay it as the next user turn.

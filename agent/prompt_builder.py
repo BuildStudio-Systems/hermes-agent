@@ -1007,13 +1007,12 @@ PLATFORM_HINTS = {
         "assume plain text. No markdown formatting (no asterisks, bullets, headers, "
         "code fences). Treat this like a conversation, not a document. Keep responses "
         "brief and natural. "
-        "File/media delivery: images referenced as MEDIA:/absolute/path tags "
-        "(.png/.jpg/.jpeg/.gif/.webp/.bmp, up to 5MB) are inlined as base64 data "
-        "URLs in responses on the chat, completions, and responses endpoints. "
-        "Non-image files are NOT intercepted anywhere, and the runs endpoint "
-        "intercepts nothing — a MEDIA: tag there renders as literal text exposing "
-        "a raw host filesystem path. For those cases, state the plain file path "
-        "in your response text instead of a MEDIA: tag."
+        "File/media delivery: when you create or download a local file for the user, "
+        "put a bare MEDIA:/absolute/path tag on its own line in the final response. "
+        "Never expose that host path as ordinary prose and never tell the user to use "
+        "SSH or a public upload service merely to retrieve it. Small images are inlined; "
+        "when secure file delivery is configured, videos and other files become "
+        "login-protected download links. Do not construct the download link yourself."
     ),
     # NOTE: a "webui" hint lived here until 2026-08-29. It was a ghost
     # (verified in the all-platform hint audit, PR #97873): no code path

@@ -60,6 +60,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -172,6 +173,13 @@ from gateway.browser_control_broker import (
     browser_control_protocol_supported,
     filter_browser_control_capabilities,
     get_browser_control_broker,
+)
+from gateway.chat_file_artifacts import (
+    DEFAULT_CHAT_FILE_MAX_BYTES,
+    DEFAULT_CHAT_FILE_TTL_SECONDS,
+    ChatFileArtifactNotFound,
+    ChatFileArtifactStore,
+    ChatFileArtifactTooLarge,
 )
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
@@ -1213,6 +1221,70 @@ def _resolve_media_to_data_urls(text: str) -> str:
         return text
 
 
+class _StreamingMediaResolver:
+    """Hold only a possible ``MEDIA:`` directive while streaming text.
+
+    Ordinary text remains live (at most five characters are retained to catch
+    a marker split across chunks).  Once a marker begins, that line is held
+    until its newline or end-of-stream so a local path never leaks in partial
+    SSE deltas before it can be replaced by a download link.
+    """
+
+    _MARKER = "MEDIA:"
+
+    def __init__(self, resolver) -> None:
+        self._resolver = resolver
+        self._buffer = ""
+        self._holding_media = False
+
+    def feed(self, text: str) -> List[str]:
+        if not text:
+            return []
+        self._buffer += text
+        output: List[str] = []
+
+        while self._buffer:
+            if self._holding_media:
+                newline = self._buffer.find("\n")
+                if newline < 0:
+                    break
+                line = self._buffer[: newline + 1]
+                self._buffer = self._buffer[newline + 1 :]
+                output.append(self._resolver(line))
+                self._holding_media = False
+                continue
+
+            marker = self._buffer.find(self._MARKER)
+            if marker >= 0:
+                if marker:
+                    output.append(self._buffer[:marker])
+                    self._buffer = self._buffer[marker:]
+                self._holding_media = True
+                continue
+
+            keep = 0
+            for length in range(1, len(self._MARKER)):
+                if self._buffer.endswith(self._MARKER[:length]):
+                    keep = length
+            if keep:
+                if len(self._buffer) > keep:
+                    output.append(self._buffer[:-keep])
+                    self._buffer = self._buffer[-keep:]
+                break
+            output.append(self._buffer)
+            self._buffer = ""
+
+        return [chunk for chunk in output if chunk]
+
+    def finish(self) -> List[str]:
+        if not self._buffer:
+            return []
+        pending = self._buffer
+        self._buffer = ""
+        self._holding_media = False
+        return [self._resolver(pending)]
+
+
 def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
     """Redact API-bound error text before it crosses the HTTP boundary."""
     redacted = redact_sensitive_text(str(value), force=True)
@@ -1552,6 +1624,32 @@ class APIServerAdapter(BasePlatformAdapter):
         self._direct_model_requests: bool = _coerce_request_bool(
             extra.get("direct_model_requests"), default=False
         )
+        file_delivery = extra.get("file_delivery") or {}
+        if not isinstance(file_delivery, dict):
+            logger.warning(
+                "Ignoring invalid platforms.api_server.extra.file_delivery config"
+            )
+            file_delivery = {}
+        self._file_delivery_enabled: bool = _coerce_request_bool(
+            file_delivery.get("enabled"), default=False
+        )
+        self._file_delivery_public_base_url: str = str(
+            file_delivery.get("public_base_url") or ""
+        ).strip().rstrip("/")
+        try:
+            self._file_delivery_ttl_seconds = max(
+                60, int(file_delivery.get("ttl_seconds", DEFAULT_CHAT_FILE_TTL_SECONDS))
+            )
+        except (TypeError, ValueError):
+            self._file_delivery_ttl_seconds = DEFAULT_CHAT_FILE_TTL_SECONDS
+        try:
+            self._file_delivery_max_bytes = max(
+                1, int(file_delivery.get("max_bytes", DEFAULT_CHAT_FILE_MAX_BYTES))
+            )
+        except (TypeError, ValueError):
+            self._file_delivery_max_bytes = DEFAULT_CHAT_FILE_MAX_BYTES
+        self._chat_file_stores: Dict[str, ChatFileArtifactStore] = {}
+        self._chat_file_store_lock = threading.Lock()
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -2220,6 +2318,10 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
+            # Authenticated delivery for files referenced by MEDIA: tags in
+            # API chat responses. The public UI uses its own login-protected
+            # proxy, so the Hermes API key never appears in a browser URL.
+            ("GET", "/v1/files/{artifact_id}", self._handle_chat_file_download),
             # Authenticated browser-control surface: POST registration
             # mints a short-lived ticket; the controller then opens the WS with
             # that ticket. Both are gated on browser.extension_control.enabled
@@ -2268,6 +2370,101 @@ class APIServerAdapter(BasePlatformAdapter):
             # by a NAS-minted JWT (NOT API_SERVER_KEY).
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
         return routes
+
+    def _get_chat_file_store(self) -> ChatFileArtifactStore:
+        """Return the profile-local file registry for the current request."""
+        from hermes_constants import get_hermes_home
+
+        hermes_home = Path(get_hermes_home()).resolve()
+        store_key = str(hermes_home)
+        store = self._chat_file_stores.get(store_key)
+        if store is not None:
+            return store
+        with self._chat_file_store_lock:
+            store = self._chat_file_stores.get(store_key)
+            if store is None:
+                store = ChatFileArtifactStore(
+                    hermes_home / "cache" / "chat-files" / "index.sqlite3",
+                    ttl_seconds=self._file_delivery_ttl_seconds,
+                    max_bytes=self._file_delivery_max_bytes,
+                )
+                self._chat_file_stores[store_key] = store
+        return store
+
+    def _resolve_media_for_delivery(self, text: str) -> str:
+        """Inline small images and turn other MEDIA tags into safe links."""
+        resolved = _resolve_media_to_data_urls(text)
+        if (
+            not resolved
+            or "MEDIA:" not in resolved
+            or not self._file_delivery_enabled
+            or not self._file_delivery_public_base_url
+        ):
+            return resolved
+
+        def _to_download_link(match: "re.Match[str]") -> str:
+            safe_path = validate_media_delivery_path(match.group("path"))
+            if not safe_path:
+                return "（文件不可用）"
+            try:
+                artifact = self._get_chat_file_store().publish(safe_path)
+            except ChatFileArtifactTooLarge:
+                return "（文件超过下载大小限制）"
+            except (OSError, ChatFileArtifactNotFound):
+                return "（文件不可用）"
+            except Exception:
+                logger.exception("Could not publish API chat file")
+                return "（文件暂时无法下载）"
+
+            encoded_name = quote(artifact.filename, safe="")
+            label = artifact.filename.replace("\\", "\\\\").replace("]", "\\]")
+            url = (
+                f"{self._file_delivery_public_base_url}/"
+                f"{artifact.artifact_id}/{encoded_name}"
+            )
+            return f"[下载 {label}]({url})"
+
+        try:
+            return MEDIA_TAG_CLEANUP_RE.sub(_to_download_link, resolved)
+        except Exception:
+            logger.exception("Could not resolve MEDIA tags for API delivery")
+            return resolved
+
+    async def _handle_chat_file_download(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not self._file_delivery_enabled:
+            raise web.HTTPNotFound()
+
+        try:
+            artifact = self._get_chat_file_store().resolve(
+                request.match_info.get("artifact_id", "")
+            )
+        except ChatFileArtifactNotFound:
+            raise web.HTTPNotFound()
+
+        safe_path = validate_media_delivery_path(artifact.path)
+        if not safe_path:
+            raise web.HTTPNotFound()
+
+        ascii_name = re.sub(r"[^A-Za-z0-9._-]", "_", artifact.filename) or "download"
+        encoded_name = quote(artifact.filename, safe="")
+        response = web.FileResponse(
+            safe_path,
+            headers={
+                "Cache-Control": "private, no-store",
+                "Content-Disposition": (
+                    f'attachment; filename="{ascii_name}"; '
+                    f"filename*=UTF-8''{encoded_name}"
+                ),
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+        response.content_type = artifact.content_type
+        return response
 
     # ------------------------------------------------------------------
     # Session header helpers
@@ -3370,6 +3567,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),
+                "chat_file_delivery": {
+                    "enabled": self._file_delivery_enabled,
+                    "download_path": "/v1/files/{artifact_id}",
+                    "public_base_url": self._file_delivery_public_base_url,
+                    "max_bytes": self._file_delivery_max_bytes,
+                    "ttl_seconds": self._file_delivery_ttl_seconds,
+                    "range_requests": True,
+                },
                 # Browser-extension control is always advertised so clients
                 # can feature-detect it, but remains disabled until
                 # browser.extension_control.enabled is explicitly set.
@@ -3428,6 +3633,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "artifact_download": {
                     "method": "GET",
                     "path": "/v1/artifacts/download/{artifact_id}",
+                },
+                "chat_file_download": {
+                    "method": "GET",
+                    "path": "/v1/files/{artifact_id}",
                 },
             },
         })
@@ -4686,7 +4895,7 @@ class APIServerAdapter(BasePlatformAdapter):
             **agent_overrides,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
-        final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+        final_response = self._resolve_media_for_delivery(result.get("final_response", "") if isinstance(result, dict) else "")
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
@@ -4822,9 +5031,15 @@ class APIServerAdapter(BasePlatformAdapter):
             except RuntimeError:
                 pass
 
+        media_stream = _StreamingMediaResolver(self._resolve_media_for_delivery)
+
         def _delta(delta: str) -> None:
             if delta:
-                _enqueue("assistant.delta", {"message_id": message_id, "delta": delta})
+                for content in media_stream.feed(delta):
+                    _enqueue(
+                        "assistant.delta",
+                        {"message_id": message_id, "delta": content},
+                    )
 
         def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
             if event_type == "reasoning.available":
@@ -4858,7 +5073,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     confirmed_runtime_lock=lock_active,
                     **agent_overrides,
                 )
-                final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+                for content in media_stream.finish():
+                    _enqueue(
+                        "assistant.delta",
+                        {"message_id": message_id, "delta": content},
+                    )
+                final_response = self._resolve_media_for_delivery(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
                 effective_runtime = {}
@@ -5340,7 +5560,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
+        final_response = self._resolve_media_for_delivery(result.get("final_response") or "")
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
         completed = bool(result.get("completed", True))
@@ -5448,6 +5668,7 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
+        media_stream = _StreamingMediaResolver(self._resolve_media_for_delivery)
 
         try:
             last_activity = time.monotonic()
@@ -5460,6 +5681,14 @@ class APIServerAdapter(BasePlatformAdapter):
             }
             await response.write(_sse_frame(role_chunk))
             last_activity = time.monotonic()
+
+            async def _emit_content(item: str) -> None:
+                content_chunk = {
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
+                }
+                await response.write(_sse_frame(content_chunk))
 
             # Helper — route a queue item to the correct SSE event.
             async def _emit(item):
@@ -5475,12 +5704,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     await response.write(_sse_frame(item[1], event="hermes.tool.progress"))
                 else:
-                    content_chunk = {
-                        "id": completion_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
-                    }
-                    await response.write(_sse_frame(content_chunk))
+                    for content in media_stream.feed(str(item)):
+                        await _emit_content(content)
                 return time.monotonic()
 
             # Stream content chunks as they arrive from the agent. Woken
@@ -5511,6 +5736,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     break
 
                 last_activity = await _emit(delta)
+
+            for content in media_stream.finish():
+                await _emit_content(content)
 
             # Get usage from completed agent. The agent can fail two ways
             # after the content queue terminates cleanly: (1) ``agent_task``
@@ -5674,6 +5902,7 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
+        media_stream = _StreamingMediaResolver(self._resolve_media_for_delivery)
 
         # State accumulated during the stream
         final_text_parts: List[str] = []
@@ -5807,7 +6036,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "item": item,
                 })
 
-            async def _emit_text_delta(delta_text: str) -> None:
+            async def _emit_resolved_text_delta(delta_text: str) -> None:
                 await _open_message_item()
                 final_text_parts.append(delta_text)
                 await _write_event("response.output_text.delta", {
@@ -5818,6 +6047,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     "delta": delta_text,
                     "logprobs": [],
                 })
+
+            async def _emit_text_delta(delta_text: str) -> None:
+                for content in media_stream.feed(delta_text):
+                    await _emit_resolved_text_delta(content)
 
             async def _emit_tool_started(payload: Dict[str, Any]) -> str:
                 """Emit response.output_item.added for a function_call.
@@ -6033,6 +6266,9 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as e:  # noqa: BLE001
                 logger.error("Error running agent for streaming responses: %s", e, exc_info=True)
                 agent_error = _redact_api_error_text(e)
+
+            for content in media_stream.finish():
+                await _emit_resolved_text_delta(content)
 
             # Close the message item if it was opened
             final_response_text = "".join(final_text_parts) or final_response_text
@@ -6478,7 +6714,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = _resolve_media_to_data_urls(result.get("final_response", ""))
+        final_response = self._resolve_media_for_delivery(result.get("final_response", ""))
+        if isinstance(result, dict):
+            result = dict(result)
+            result["final_response"] = final_response
         if not final_response:
             final_response = _redact_api_error_text(result.get("error", "(No response generated)"))
 
