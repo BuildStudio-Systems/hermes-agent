@@ -24,6 +24,7 @@ from gateway.config import PlatformConfig  # noqa: E402
 from gateway.platforms.api_server import (  # noqa: E402
     APIServerAdapter,
     _StreamingMediaResolver,
+    _api_request_file_owner,
     _resolve_media_to_data_urls,
 )
 from gateway.platforms.base import BasePlatformAdapter  # noqa: E402
@@ -162,8 +163,12 @@ def test_lowercase_extensionless_media_becomes_download_link(
 
 
 @pytest.mark.parametrize("strict_value", [None, "0"])
+@pytest.mark.parametrize(
+    "directive_template",
+    ["MEDIA:{}", 'MEDIA:"{}"', "MEDIA:'{}'", "MEDIA:`{}`"],
+)
 def test_disabled_or_non_strict_delivery_redacts_host_path(
-    tmp_path: Path, monkeypatch, strict_value
+    tmp_path: Path, monkeypatch, strict_value, directive_template
 ):
     source = tmp_path / "private.mp4"
     source.write_bytes(b"video")
@@ -186,7 +191,7 @@ def test_disabled_or_non_strict_delivery_redacts_host_path(
     )
 
     output = adapter._resolve_media_for_delivery(
-        f"MEDIA:{source}", owner_id="user-1"
+        directive_template.format(source), owner_id="user-1"
     )
 
     assert str(source) not in output
@@ -215,11 +220,38 @@ def test_delivery_failure_redacts_host_path(tmp_path: Path, monkeypatch):
     )
 
     output = adapter._resolve_media_for_delivery(
-        f"MEDIA:{source}", owner_id="user-1"
+        f'MEDIA:"{source}"', owner_id="user-1"
     )
 
     assert str(source) not in output
     assert "unavailable" in output.lower()
+
+
+def test_streaming_resolvers_capture_request_owner(monkeypatch):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    resolved_owners = []
+
+    def resolve(text, *, owner_id=None):
+        resolved_owners.append(owner_id)
+        return text
+
+    monkeypatch.setattr(adapter, "_resolve_media_for_delivery", resolve)
+
+    first_token = _api_request_file_owner.set("user-1")
+    try:
+        first = adapter._media_resolver_for_request()
+    finally:
+        _api_request_file_owner.reset(first_token)
+
+    second_token = _api_request_file_owner.set("user-2")
+    try:
+        second = adapter._media_resolver_for_request()
+        first.feed("MEDIA:/tmp/first.mp4\n")
+        second.feed("MEDIA:/tmp/second.mp4\n")
+    finally:
+        _api_request_file_owner.reset(second_token)
+
+    assert resolved_owners == ["user-1", "user-2"]
 
 
 @pytest.mark.skipif(web is None, reason="aiohttp is not installed")
@@ -260,6 +292,15 @@ async def test_download_endpoint_requires_auth_and_supports_range(
             headers={"Authorization": "Bearer test-api-key"},
         )
         assert missing_owner.status == 404
+
+        invalid_owner = await client.get(
+            f"/v1/files/{artifact_id}",
+            headers={
+                "Authorization": "Bearer test-api-key",
+                "X-BuildStudio-User-Id": "../user-1",
+            },
+        )
+        assert invalid_owner.status == 404
 
         response = await client.get(
             f"/v1/files/{artifact_id}",

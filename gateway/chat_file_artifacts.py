@@ -25,6 +25,13 @@ from pathlib import Path
 DEFAULT_CHAT_FILE_TTL_SECONDS = 12 * 60 * 60
 DEFAULT_CHAT_FILE_MAX_BYTES = 512 * 1024 * 1024
 _ARTIFACT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_OWNER_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+
+def normalize_chat_file_owner(value: object) -> str:
+    """Return a canonical owner id, or an empty string for unsafe input."""
+    owner_id = str(value or "").strip()
+    return owner_id if _OWNER_ID_RE.fullmatch(owner_id) else ""
 
 
 class ChatFileArtifactError(Exception):
@@ -125,9 +132,9 @@ class ChatFileArtifactStore:
         )
 
     def publish(self, path: str, *, owner_id: str) -> ChatFileArtifact:
-        owner_id = str(owner_id or "").strip()
+        owner_id = normalize_chat_file_owner(owner_id)
         if not owner_id:
-            raise ChatFileArtifactNotFound("Artifact owner is required")
+            raise ChatFileArtifactNotFound("Artifact owner is invalid")
         source = Path(path).resolve(strict=True)
         stat = source.stat()
         if not source.is_file():
@@ -190,9 +197,9 @@ class ChatFileArtifactStore:
     def resolve(self, artifact_id: str, *, owner_id: str) -> ChatFileArtifact:
         if not _ARTIFACT_ID_RE.fullmatch(str(artifact_id or "")):
             raise ChatFileArtifactNotFound("Invalid artifact id")
-        owner_id = str(owner_id or "").strip()
+        owner_id = normalize_chat_file_owner(owner_id)
         if not owner_id:
-            raise ChatFileArtifactNotFound("Artifact owner is required")
+            raise ChatFileArtifactNotFound("Artifact owner is invalid")
 
         now = time.time()
         with closing(self._connect()) as connection:

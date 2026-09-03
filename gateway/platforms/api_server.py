@@ -96,7 +96,6 @@ _api_request_browser_control_transport_family: ContextVar[str] = ContextVar(
     "api_server_browser_control_transport_family", default=""
 )
 _FILE_OWNER_HEADER = "X-BuildStudio-User-Id"
-_FILE_OWNER_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _api_request_file_owner: ContextVar[str] = ContextVar(
     "api_server_file_owner", default=""
 )
@@ -186,6 +185,7 @@ from gateway.chat_file_artifacts import (
     ChatFileArtifactNotFound,
     ChatFileArtifactStore,
     ChatFileArtifactTooLarge,
+    normalize_chat_file_owner,
 )
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
@@ -1228,7 +1228,7 @@ def _resolve_media_to_data_urls(text: str) -> str:
 
 
 _UNRESOLVED_MEDIA_DIRECTIVE_RE = re.compile(
-    r'''[`"'*_]{0,3}MEDIA:\s*(?:~/|/|[A-Za-z]:[/\\])[^\r\n]*''',
+    r'''[`"'*_]{0,3}MEDIA:\s*[`"']?(?:~/|/|[A-Za-z]:[/\\])[^\r\n]*''',
     re.IGNORECASE,
 )
 
@@ -2430,8 +2430,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _normalize_file_owner(value: Any) -> str:
-        owner = str(value or "").strip()
-        return owner if _FILE_OWNER_RE.fullmatch(owner) else ""
+        return normalize_chat_file_owner(value)
 
     def _media_resolver_for_request(self) -> _StreamingMediaResolver:
         owner_id = _api_request_file_owner.get()
