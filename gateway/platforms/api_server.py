@@ -95,6 +95,11 @@ _api_request_browser_control_principal: ContextVar[str] = ContextVar(
 _api_request_browser_control_transport_family: ContextVar[str] = ContextVar(
     "api_server_browser_control_transport_family", default=""
 )
+_FILE_OWNER_HEADER = "X-BuildStudio-User-Id"
+_FILE_OWNER_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_api_request_file_owner: ContextVar[str] = ContextVar(
+    "api_server_file_owner", default=""
+)
 
 #: Minimal scope shape accepted by :func:`gateway.browser_control_artifacts
 #: .artifact_scope_key`: principal + session + transport family.  The API
@@ -2313,9 +2318,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     family_token = _api_request_browser_control_transport_family.set(
                         self._browser_control_transport_family(request)
                     )
+                    file_owner_token = _api_request_file_owner.set(
+                        self._normalize_file_owner(
+                            request.headers.get(_FILE_OWNER_HEADER, "")
+                        )
+                    )
                     try:
                         return await handler(request)
                     finally:
+                        _api_request_file_owner.reset(file_owner_token)
                         _api_request_browser_control_transport_family.reset(family_token)
                         _api_request_browser_control_principal.reset(principal_token)
             finally:
@@ -2417,11 +2428,27 @@ class APIServerAdapter(BasePlatformAdapter):
             and _media_delivery_strict_mode()
         )
 
-    def _resolve_media_for_delivery(self, text: str) -> str:
+    @staticmethod
+    def _normalize_file_owner(value: Any) -> str:
+        owner = str(value or "").strip()
+        return owner if _FILE_OWNER_RE.fullmatch(owner) else ""
+
+    def _media_resolver_for_request(self) -> _StreamingMediaResolver:
+        owner_id = _api_request_file_owner.get()
+        return _StreamingMediaResolver(
+            lambda text: self._resolve_media_for_delivery(text, owner_id=owner_id)
+        )
+
+    def _resolve_media_for_delivery(
+        self, text: str, *, owner_id: Optional[str] = None
+    ) -> str:
         """Inline small images and turn other MEDIA tags into safe links."""
         if not text or "media:" not in text.lower():
             return text
-        if not self._file_delivery_active():
+        owner_id = self._normalize_file_owner(
+            _api_request_file_owner.get() if owner_id is None else owner_id
+        )
+        if not self._file_delivery_active() or not owner_id:
             return _redact_unresolved_media_directives(text)
         try:
             resolved = _resolve_media_to_data_urls(text)
@@ -2433,7 +2460,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     deliveries.append("(File unavailable)")
                     continue
                 try:
-                    artifact = self._get_chat_file_store().publish(safe_path)
+                    artifact = self._get_chat_file_store().publish(
+                        safe_path, owner_id=owner_id
+                    )
                 except ChatFileArtifactTooLarge:
                     deliveries.append("(File exceeds the download size limit)")
                     continue
@@ -2471,10 +2500,15 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
         if not self._file_delivery_active():
             raise web.HTTPNotFound()
+        owner_id = self._normalize_file_owner(
+            request.headers.get(_FILE_OWNER_HEADER, "")
+        )
+        if not owner_id:
+            raise web.HTTPNotFound()
 
         try:
             artifact = self._get_chat_file_store().resolve(
-                request.match_info.get("artifact_id", "")
+                request.match_info.get("artifact_id", ""), owner_id=owner_id
             )
         except ChatFileArtifactNotFound:
             raise web.HTTPNotFound()
@@ -3604,6 +3638,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "enabled": self._file_delivery_active(),
                     "download_path": "/v1/files/{artifact_id}",
                     "public_base_url": self._file_delivery_public_base_url,
+                    "owner_header": _FILE_OWNER_HEADER,
                     "max_bytes": self._file_delivery_max_bytes,
                     "ttl_seconds": self._file_delivery_ttl_seconds,
                     "range_requests": True,
@@ -5064,7 +5099,7 @@ class APIServerAdapter(BasePlatformAdapter):
             except RuntimeError:
                 pass
 
-        media_stream = _StreamingMediaResolver(self._resolve_media_for_delivery)
+        media_stream = self._media_resolver_for_request()
 
         def _delta(delta: str) -> None:
             if delta:
@@ -5701,7 +5736,7 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
-        media_stream = _StreamingMediaResolver(self._resolve_media_for_delivery)
+        media_stream = self._media_resolver_for_request()
 
         try:
             last_activity = time.monotonic()
@@ -5935,7 +5970,7 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
-        media_stream = _StreamingMediaResolver(self._resolve_media_for_delivery)
+        media_stream = self._media_resolver_for_request()
 
         # State accumulated during the stream
         final_text_parts: List[str] = []

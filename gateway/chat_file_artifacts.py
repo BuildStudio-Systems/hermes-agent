@@ -42,6 +42,7 @@ class ChatFileArtifactTooLarge(ChatFileArtifactError):
 @dataclass(frozen=True)
 class ChatFileArtifact:
     artifact_id: str
+    owner_id: str
     path: str
     filename: str
     content_type: str
@@ -88,6 +89,7 @@ class ChatFileArtifactStore:
                     """
                     CREATE TABLE IF NOT EXISTS chat_file_artifacts (
                         artifact_id TEXT PRIMARY KEY,
+                        owner_id TEXT NOT NULL,
                         path TEXT NOT NULL,
                         filename TEXT NOT NULL,
                         content_type TEXT NOT NULL,
@@ -97,9 +99,24 @@ class ChatFileArtifactStore:
                     )
                     """
                 )
+                columns = {
+                    str(row["name"])
+                    for row in connection.execute(
+                        "PRAGMA table_info(chat_file_artifacts)"
+                    ).fetchall()
+                }
+                if "owner_id" not in columns:
+                    # Existing links predate per-user binding. Keep their rows
+                    # only for normal expiry/pruning; an empty owner can never
+                    # satisfy publish/resolve and therefore cannot be reused.
+                    connection.execute(
+                        "ALTER TABLE chat_file_artifacts "
+                        "ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''"
+                    )
+                connection.execute("DROP INDEX IF EXISTS chat_file_artifacts_source")
                 connection.execute(
                     "CREATE INDEX IF NOT EXISTS chat_file_artifacts_source "
-                    "ON chat_file_artifacts(path, size_bytes, mtime_ns, expires_at)"
+                    "ON chat_file_artifacts(owner_id, path, size_bytes, mtime_ns, expires_at)"
                 )
 
     def _prune(self, connection: sqlite3.Connection, now: float) -> None:
@@ -107,7 +124,10 @@ class ChatFileArtifactStore:
             "DELETE FROM chat_file_artifacts WHERE expires_at <= ?", (now,)
         )
 
-    def publish(self, path: str) -> ChatFileArtifact:
+    def publish(self, path: str, *, owner_id: str) -> ChatFileArtifact:
+        owner_id = str(owner_id or "").strip()
+        if not owner_id:
+            raise ChatFileArtifactNotFound("Artifact owner is required")
         source = Path(path).resolve(strict=True)
         stat = source.stat()
         if not source.is_file():
@@ -127,10 +147,11 @@ class ChatFileArtifactStore:
                 existing = connection.execute(
                     """
                     SELECT * FROM chat_file_artifacts
-                    WHERE path = ? AND size_bytes = ? AND mtime_ns = ? AND expires_at > ?
+                    WHERE owner_id = ? AND path = ? AND size_bytes = ?
+                      AND mtime_ns = ? AND expires_at > ?
                     ORDER BY expires_at DESC LIMIT 1
                     """,
-                    (str(source), stat.st_size, stat.st_mtime_ns, now),
+                    (owner_id, str(source), stat.st_size, stat.st_mtime_ns, now),
                 ).fetchone()
                 if existing is not None:
                     return self._from_row(existing)
@@ -139,12 +160,13 @@ class ChatFileArtifactStore:
                 connection.execute(
                     """
                     INSERT INTO chat_file_artifacts
-                        (artifact_id, path, filename, content_type, size_bytes,
+                        (artifact_id, owner_id, path, filename, content_type, size_bytes,
                          mtime_ns, expires_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         artifact_id,
+                        owner_id,
                         str(source),
                         source.name,
                         content_type,
@@ -156,6 +178,7 @@ class ChatFileArtifactStore:
 
         return ChatFileArtifact(
             artifact_id=artifact_id,
+            owner_id=owner_id,
             path=str(source),
             filename=source.name,
             content_type=content_type,
@@ -164,17 +187,21 @@ class ChatFileArtifactStore:
             expires_at=expires_at,
         )
 
-    def resolve(self, artifact_id: str) -> ChatFileArtifact:
+    def resolve(self, artifact_id: str, *, owner_id: str) -> ChatFileArtifact:
         if not _ARTIFACT_ID_RE.fullmatch(str(artifact_id or "")):
             raise ChatFileArtifactNotFound("Invalid artifact id")
+        owner_id = str(owner_id or "").strip()
+        if not owner_id:
+            raise ChatFileArtifactNotFound("Artifact owner is required")
 
         now = time.time()
         with closing(self._connect()) as connection:
             with connection:
                 self._prune(connection, now)
                 row = connection.execute(
-                    "SELECT * FROM chat_file_artifacts WHERE artifact_id = ?",
-                    (artifact_id,),
+                    "SELECT * FROM chat_file_artifacts "
+                    "WHERE artifact_id = ? AND owner_id = ?",
+                    (artifact_id, owner_id),
                 ).fetchone()
                 if row is None:
                     raise ChatFileArtifactNotFound("Artifact not found")
@@ -197,6 +224,7 @@ class ChatFileArtifactStore:
     def _from_row(row: sqlite3.Row) -> ChatFileArtifact:
         return ChatFileArtifact(
             artifact_id=str(row["artifact_id"]),
+            owner_id=str(row["owner_id"]),
             path=str(row["path"]),
             filename=str(row["filename"]),
             content_type=str(row["content_type"]),

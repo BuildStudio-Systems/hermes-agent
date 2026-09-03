@@ -89,7 +89,9 @@ def test_non_image_media_becomes_download_link(tmp_path: Path, monkeypatch):
     store = ChatFileArtifactStore(tmp_path / "artifacts.sqlite3")
     adapter._get_chat_file_store = lambda: store
 
-    output = adapter._resolve_media_for_delivery(f"好了。\nMEDIA:{source}")
+    output = adapter._resolve_media_for_delivery(
+        f"好了。\nMEDIA:{source}", owner_id="user-1"
+    )
 
     assert "MEDIA:" not in output
     assert str(source) not in output
@@ -150,7 +152,9 @@ def test_lowercase_extensionless_media_becomes_download_link(
         tmp_path / "artifacts.sqlite3"
     )
 
-    output = adapter._resolve_media_for_delivery(f"media:{source}")
+    output = adapter._resolve_media_for_delivery(
+        f"media:{source}", owner_id="user-1"
+    )
 
     assert "media:" not in output.lower()
     assert str(source) not in output
@@ -181,7 +185,9 @@ def test_disabled_or_non_strict_delivery_redacts_host_path(
         )
     )
 
-    output = adapter._resolve_media_for_delivery(f"MEDIA:{source}")
+    output = adapter._resolve_media_for_delivery(
+        f"MEDIA:{source}", owner_id="user-1"
+    )
 
     assert str(source) not in output
     assert "unavailable" in output.lower()
@@ -208,7 +214,9 @@ def test_delivery_failure_redacts_host_path(tmp_path: Path, monkeypatch):
         staticmethod(lambda _text: (_ for _ in ()).throw(RuntimeError("boom"))),
     )
 
-    output = adapter._resolve_media_for_delivery(f"MEDIA:{source}")
+    output = adapter._resolve_media_for_delivery(
+        f"MEDIA:{source}", owner_id="user-1"
+    )
 
     assert str(source) not in output
     assert "unavailable" in output.lower()
@@ -236,7 +244,9 @@ async def test_download_endpoint_requires_auth_and_supports_range(
     )
     store = ChatFileArtifactStore(tmp_path / "artifacts.sqlite3")
     adapter._get_chat_file_store = lambda: store
-    link = adapter._resolve_media_for_delivery(f"MEDIA:{source}")
+    link = adapter._resolve_media_for_delivery(
+        f"MEDIA:{source}", owner_id="user-1"
+    )
     artifact_id = re.search(r"/([0-9a-f]{32})/", link).group(1)
 
     app = web.Application()
@@ -245,17 +255,33 @@ async def test_download_endpoint_requires_auth_and_supports_range(
         unauthenticated = await client.get(f"/v1/files/{artifact_id}")
         assert unauthenticated.status == 401
 
+        missing_owner = await client.get(
+            f"/v1/files/{artifact_id}",
+            headers={"Authorization": "Bearer test-api-key"},
+        )
+        assert missing_owner.status == 404
+
         response = await client.get(
             f"/v1/files/{artifact_id}",
             headers={
                 "Authorization": "Bearer test-api-key",
                 "Range": "bytes=2-5",
+                "X-BuildStudio-User-Id": "user-1",
             },
         )
         assert response.status == 206
         assert await response.read() == b"2345"
         assert response.headers["Accept-Ranges"] == "bytes"
         assert "attachment" in response.headers["Content-Disposition"]
+
+        wrong_owner = await client.get(
+            f"/v1/files/{artifact_id}",
+            headers={
+                "Authorization": "Bearer test-api-key",
+                "X-BuildStudio-User-Id": "user-2",
+            },
+        )
+        assert wrong_owner.status == 404
 
 
 if __name__ == "__main__":

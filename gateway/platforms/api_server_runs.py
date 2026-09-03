@@ -620,9 +620,7 @@ async def _handle_runs(
     self._run_approval_sessions[run_id] = approval_session_key
 
     event_cb = self._make_run_event_callback(run_id, loop)
-    media_stream = _api_server._StreamingMediaResolver(
-        self._resolve_media_for_delivery
-    )
+    media_stream = self._media_resolver_for_request()
 
     def _put_event_if_active(event: Optional[Dict]) -> None:
         """Enqueue only while this run still owns live transport state."""
