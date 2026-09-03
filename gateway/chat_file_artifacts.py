@@ -8,16 +8,21 @@ both before :meth:`publish` and after :meth:`resolve`.
 
 from __future__ import annotations
 
+import os
 import mimetypes
 import re
 import secrets
 import sqlite3
 import time
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
 
-DEFAULT_CHAT_FILE_TTL_SECONDS = 7 * 24 * 60 * 60
+# Generated media is cleaned from the Hermes cache after roughly one day.
+# Keep links comfortably inside that retention boundary instead of promising a
+# longer lifetime than the underlying file can provide.
+DEFAULT_CHAT_FILE_TTL_SECONDS = 12 * 60 * 60
 DEFAULT_CHAT_FILE_MAX_BYTES = 512 * 1024 * 1024
 _ARTIFACT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
@@ -58,8 +63,18 @@ class ChatFileArtifactStore:
         self.db_path = Path(db_path)
         self.ttl_seconds = max(60, int(ttl_seconds))
         self.max_bytes = max(1, int(max_bytes))
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._protect_path(self.db_path.parent, 0o700)
         self._initialize()
+        self._protect_path(self.db_path, 0o600)
+
+    @staticmethod
+    def _protect_path(path: Path, mode: int) -> None:
+        """Best-effort private permissions; systemd also runs with UMask=0077."""
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            pass
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(str(self.db_path), timeout=5)
@@ -67,24 +82,25 @@ class ChatFileArtifactStore:
         return connection
 
     def _initialize(self) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS chat_file_artifacts (
-                    artifact_id TEXT PRIMARY KEY,
-                    path TEXT NOT NULL,
-                    filename TEXT NOT NULL,
-                    content_type TEXT NOT NULL,
-                    size_bytes INTEGER NOT NULL,
-                    mtime_ns INTEGER NOT NULL,
-                    expires_at REAL NOT NULL
+        with closing(self._connect()) as connection:
+            with connection:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS chat_file_artifacts (
+                        artifact_id TEXT PRIMARY KEY,
+                        path TEXT NOT NULL,
+                        filename TEXT NOT NULL,
+                        content_type TEXT NOT NULL,
+                        size_bytes INTEGER NOT NULL,
+                        mtime_ns INTEGER NOT NULL,
+                        expires_at REAL NOT NULL
+                    )
+                    """
                 )
-                """
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS chat_file_artifacts_source "
-                "ON chat_file_artifacts(path, size_bytes, mtime_ns, expires_at)"
-            )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS chat_file_artifacts_source "
+                    "ON chat_file_artifacts(path, size_bytes, mtime_ns, expires_at)"
+                )
 
     def _prune(self, connection: sqlite3.Connection, now: float) -> None:
         connection.execute(
@@ -105,37 +121,38 @@ class ChatFileArtifactStore:
         expires_at = now + self.ttl_seconds
         content_type = mimetypes.guess_type(source.name)[0] or "application/octet-stream"
 
-        with self._connect() as connection:
-            self._prune(connection, now)
-            existing = connection.execute(
-                """
-                SELECT * FROM chat_file_artifacts
-                WHERE path = ? AND size_bytes = ? AND mtime_ns = ? AND expires_at > ?
-                ORDER BY expires_at DESC LIMIT 1
-                """,
-                (str(source), stat.st_size, stat.st_mtime_ns, now),
-            ).fetchone()
-            if existing is not None:
-                return self._from_row(existing)
+        with closing(self._connect()) as connection:
+            with connection:
+                self._prune(connection, now)
+                existing = connection.execute(
+                    """
+                    SELECT * FROM chat_file_artifacts
+                    WHERE path = ? AND size_bytes = ? AND mtime_ns = ? AND expires_at > ?
+                    ORDER BY expires_at DESC LIMIT 1
+                    """,
+                    (str(source), stat.st_size, stat.st_mtime_ns, now),
+                ).fetchone()
+                if existing is not None:
+                    return self._from_row(existing)
 
-            artifact_id = secrets.token_hex(16)
-            connection.execute(
-                """
-                INSERT INTO chat_file_artifacts
-                    (artifact_id, path, filename, content_type, size_bytes,
-                     mtime_ns, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    artifact_id,
-                    str(source),
-                    source.name,
-                    content_type,
-                    stat.st_size,
-                    stat.st_mtime_ns,
-                    expires_at,
-                ),
-            )
+                artifact_id = secrets.token_hex(16)
+                connection.execute(
+                    """
+                    INSERT INTO chat_file_artifacts
+                        (artifact_id, path, filename, content_type, size_bytes,
+                         mtime_ns, expires_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        artifact_id,
+                        str(source),
+                        source.name,
+                        content_type,
+                        stat.st_size,
+                        stat.st_mtime_ns,
+                        expires_at,
+                    ),
+                )
 
         return ChatFileArtifact(
             artifact_id=artifact_id,
@@ -152,15 +169,16 @@ class ChatFileArtifactStore:
             raise ChatFileArtifactNotFound("Invalid artifact id")
 
         now = time.time()
-        with self._connect() as connection:
-            self._prune(connection, now)
-            row = connection.execute(
-                "SELECT * FROM chat_file_artifacts WHERE artifact_id = ?",
-                (artifact_id,),
-            ).fetchone()
-            if row is None:
-                raise ChatFileArtifactNotFound("Artifact not found")
-            artifact = self._from_row(row)
+        with closing(self._connect()) as connection:
+            with connection:
+                self._prune(connection, now)
+                row = connection.execute(
+                    "SELECT * FROM chat_file_artifacts WHERE artifact_id = ?",
+                    (artifact_id,),
+                ).fetchone()
+                if row is None:
+                    raise ChatFileArtifactNotFound("Artifact not found")
+                artifact = self._from_row(row)
 
         try:
             source = Path(artifact.path).resolve(strict=True)

@@ -39,6 +39,22 @@ def test_media_delivery_denies_encrypted_bitwarden_cache(tmp_path, monkeypatch):
     assert base.validate_media_delivery_path(str(path)) is None
 
 
+def test_media_delivery_denies_chat_file_registry(tmp_path, monkeypatch):
+    import gateway.platforms.base as base
+
+    hermes_home = tmp_path / ".hermes"
+    registry = hermes_home / "cache" / "chat-files" / "index.sqlite3"
+    registry.parent.mkdir(parents=True)
+    registry.write_bytes(b"private artifact index")
+    monkeypatch.setattr(base, "_HERMES_HOME", hermes_home)
+    monkeypatch.setattr(base, "_HERMES_ROOT", hermes_home)
+    monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "1")
+    monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "1")
+
+    assert registry.parent in base._media_delivery_denied_paths()
+    assert base.validate_media_delivery_path(str(registry)) is None
+
+
 class TestInboundMediaSizeCap:
     """gateway.max_inbound_media_bytes caps inbound media buffered into RAM (#13145)."""
 

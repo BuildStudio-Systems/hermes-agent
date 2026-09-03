@@ -146,6 +146,7 @@ from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE,
     BasePlatformAdapter,
     SendResult,
+    _media_delivery_strict_mode,
     is_network_accessible,
     validate_media_delivery_path,
 )
@@ -1221,6 +1222,17 @@ def _resolve_media_to_data_urls(text: str) -> str:
         return text
 
 
+_UNRESOLVED_MEDIA_DIRECTIVE_RE = re.compile(
+    r'''[`"'*_]{0,3}MEDIA:\s*(?:~/|/|[A-Za-z]:[/\\])[^\r\n]*''',
+    re.IGNORECASE,
+)
+
+
+def _redact_unresolved_media_directives(text: str) -> str:
+    """Never expose an unresolved absolute host path to an API client."""
+    return _UNRESOLVED_MEDIA_DIRECTIVE_RE.sub("(File unavailable)", text)
+
+
 class _StreamingMediaResolver:
     """Hold only a possible ``MEDIA:`` directive while streaming text.
 
@@ -1230,7 +1242,7 @@ class _StreamingMediaResolver:
     SSE deltas before it can be replaced by a download link.
     """
 
-    _MARKER = "MEDIA:"
+    _MARKER = "media:"
 
     def __init__(self, resolver) -> None:
         self._resolver = resolver
@@ -1254,7 +1266,8 @@ class _StreamingMediaResolver:
                 self._holding_media = False
                 continue
 
-            marker = self._buffer.find(self._MARKER)
+            lower_buffer = self._buffer.lower()
+            marker = lower_buffer.find(self._MARKER)
             if marker >= 0:
                 if marker:
                     output.append(self._buffer[:marker])
@@ -1264,7 +1277,7 @@ class _StreamingMediaResolver:
 
             keep = 0
             for length in range(1, len(self._MARKER)):
-                if self._buffer.endswith(self._MARKER[:length]):
+                if lower_buffer.endswith(self._MARKER[:length]):
                     keep = length
             if keep:
                 if len(self._buffer) > keep:
@@ -1636,6 +1649,11 @@ class APIServerAdapter(BasePlatformAdapter):
         self._file_delivery_public_base_url: str = str(
             file_delivery.get("public_base_url") or ""
         ).strip().rstrip("/")
+        if self._file_delivery_public_base_url and not re.fullmatch(
+            r"/(?:[A-Za-z0-9._~-]+/?)*", self._file_delivery_public_base_url
+        ):
+            logger.warning("Ignoring unsafe API chat file public_base_url")
+            self._file_delivery_public_base_url = ""
         try:
             self._file_delivery_ttl_seconds = max(
                 60, int(file_delivery.get("ttl_seconds", DEFAULT_CHAT_FILE_TTL_SECONDS))
@@ -2391,44 +2409,59 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._chat_file_stores[store_key] = store
         return store
 
+    def _file_delivery_active(self) -> bool:
+        """File links are available only under the strict media policy."""
+        return bool(
+            self._file_delivery_enabled
+            and self._file_delivery_public_base_url
+            and _media_delivery_strict_mode()
+        )
+
     def _resolve_media_for_delivery(self, text: str) -> str:
         """Inline small images and turn other MEDIA tags into safe links."""
-        resolved = _resolve_media_to_data_urls(text)
-        if (
-            not resolved
-            or "MEDIA:" not in resolved
-            or not self._file_delivery_enabled
-            or not self._file_delivery_public_base_url
-        ):
-            return resolved
-
-        def _to_download_link(match: "re.Match[str]") -> str:
-            safe_path = validate_media_delivery_path(match.group("path"))
-            if not safe_path:
-                return "（文件不可用）"
-            try:
-                artifact = self._get_chat_file_store().publish(safe_path)
-            except ChatFileArtifactTooLarge:
-                return "（文件超过下载大小限制）"
-            except (OSError, ChatFileArtifactNotFound):
-                return "（文件不可用）"
-            except Exception:
-                logger.exception("Could not publish API chat file")
-                return "（文件暂时无法下载）"
-
-            encoded_name = quote(artifact.filename, safe="")
-            label = artifact.filename.replace("\\", "\\\\").replace("]", "\\]")
-            url = (
-                f"{self._file_delivery_public_base_url}/"
-                f"{artifact.artifact_id}/{encoded_name}"
-            )
-            return f"[下载 {label}]({url})"
-
+        if not text or "media:" not in text.lower():
+            return text
+        if not self._file_delivery_active():
+            return _redact_unresolved_media_directives(text)
         try:
-            return MEDIA_TAG_CLEANUP_RE.sub(_to_download_link, resolved)
+            resolved = _resolve_media_to_data_urls(text)
+            media, cleaned = BasePlatformAdapter.extract_media(resolved)
+            deliveries: List[str] = []
+            for path, _is_voice in media:
+                safe_path = validate_media_delivery_path(path)
+                if not safe_path:
+                    deliveries.append("(File unavailable)")
+                    continue
+                try:
+                    artifact = self._get_chat_file_store().publish(safe_path)
+                except ChatFileArtifactTooLarge:
+                    deliveries.append("(File exceeds the download size limit)")
+                    continue
+                except (OSError, ChatFileArtifactNotFound):
+                    deliveries.append("(File unavailable)")
+                    continue
+                except Exception:
+                    logger.exception("Could not publish API chat file")
+                    deliveries.append("(File temporarily unavailable)")
+                    continue
+
+                encoded_name = quote(artifact.filename, safe="")
+                label = re.sub(r"[\r\n]", " ", artifact.filename)
+                label = label.replace("\\", "\\\\").replace("]", "\\]")
+                url = (
+                    f"{self._file_delivery_public_base_url}/"
+                    f"{artifact.artifact_id}/{encoded_name}"
+                )
+                deliveries.append(f"[Download {label}]({url})")
+
+            output = cleaned.rstrip()
+            if deliveries:
+                output = f"{output}\n" if output else ""
+                output += "\n".join(deliveries)
+            return _redact_unresolved_media_directives(output)
         except Exception:
             logger.exception("Could not resolve MEDIA tags for API delivery")
-            return resolved
+            return _redact_unresolved_media_directives(text)
 
     async def _handle_chat_file_download(
         self, request: "web.Request"
@@ -2436,7 +2469,7 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
-        if not self._file_delivery_enabled:
+        if not self._file_delivery_active():
             raise web.HTTPNotFound()
 
         try:
@@ -3568,7 +3601,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),
                 "chat_file_delivery": {
-                    "enabled": self._file_delivery_enabled,
+                    "enabled": self._file_delivery_active(),
                     "download_path": "/v1/files/{artifact_id}",
                     "public_base_url": self._file_delivery_public_base_url,
                     "max_bytes": self._file_delivery_max_bytes,

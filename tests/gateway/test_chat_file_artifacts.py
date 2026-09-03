@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from gateway.chat_file_artifacts import (
+    DEFAULT_CHAT_FILE_TTL_SECONDS,
     ChatFileArtifactNotFound,
     ChatFileArtifactStore,
     ChatFileArtifactTooLarge,
@@ -53,3 +54,30 @@ def test_resolve_rejects_unminted_id(tmp_path: Path) -> None:
 
     with pytest.raises(ChatFileArtifactNotFound):
         store.resolve("../../etc/passwd")
+
+
+def test_default_ttl_stays_inside_media_cache_retention() -> None:
+    assert DEFAULT_CHAT_FILE_TTL_SECONDS == 12 * 60 * 60
+
+
+def test_database_connections_are_closed_after_operations(tmp_path: Path) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"video")
+    database = tmp_path / "index.sqlite3"
+    store = ChatFileArtifactStore(database)
+
+    artifact = store.publish(str(source))
+    store.resolve(artifact.artifact_id)
+
+    moved = tmp_path / "moved.sqlite3"
+    database.replace(moved)
+    moved.replace(database)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission assertion")
+def test_registry_uses_private_permissions(tmp_path: Path) -> None:
+    registry = tmp_path / "private" / "index.sqlite3"
+    ChatFileArtifactStore(registry)
+
+    assert registry.parent.stat().st_mode & 0o777 == 0o700
+    assert registry.stat().st_mode & 0o777 == 0o600

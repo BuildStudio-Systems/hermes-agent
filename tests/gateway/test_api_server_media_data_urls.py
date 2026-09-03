@@ -26,6 +26,7 @@ from gateway.platforms.api_server import (  # noqa: E402
     _StreamingMediaResolver,
     _resolve_media_to_data_urls,
 )
+from gateway.platforms.base import BasePlatformAdapter  # noqa: E402
 
 # 1x1 transparent PNG
 _PNG_BYTES = base64.b64decode(
@@ -64,7 +65,14 @@ class TestResolveMediaToDataUrls(unittest.TestCase):
         self.assertEqual(_resolve_media_to_data_urls(text), text)
 
 
-def test_non_image_media_becomes_download_link(tmp_path: Path):
+def _enable_strict_test_media(monkeypatch, root: Path) -> None:
+    monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "1")
+    monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "0")
+    monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(root))
+
+
+def test_non_image_media_becomes_download_link(tmp_path: Path, monkeypatch):
+    _enable_strict_test_media(monkeypatch, tmp_path)
     source = tmp_path / "result video.mp4"
     source.write_bytes(b"video")
     adapter = APIServerAdapter(
@@ -104,9 +112,114 @@ def test_streaming_resolver_never_emits_partial_local_path():
     assert "".join(chunks) == "Ready. [download](/safe/file)"
 
 
+def test_streaming_resolver_holds_lowercase_media_path():
+    resolver = _StreamingMediaResolver(
+        lambda text: re.sub(
+            r"media:/tmp/result\.custom", "[download](/safe/file)", text, flags=re.I
+        )
+    )
+
+    chunks = []
+    chunks.extend(resolver.feed("Ready. me"))
+    chunks.extend(resolver.feed("dia:/tmp/res"))
+    chunks.extend(resolver.feed("ult.custom"))
+
+    assert "/tmp/" not in "".join(chunks)
+    chunks.extend(resolver.finish())
+    assert "".join(chunks) == "Ready. [download](/safe/file)"
+
+
+def test_lowercase_extensionless_media_becomes_download_link(
+    tmp_path: Path, monkeypatch
+):
+    _enable_strict_test_media(monkeypatch, tmp_path)
+    source = tmp_path / "result.custom"
+    source.write_bytes(b"artifact")
+    adapter = APIServerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "file_delivery": {
+                    "enabled": True,
+                    "public_base_url": "/api/v1/agent-files",
+                }
+            },
+        )
+    )
+    adapter._get_chat_file_store = lambda: ChatFileArtifactStore(
+        tmp_path / "artifacts.sqlite3"
+    )
+
+    output = adapter._resolve_media_for_delivery(f"media:{source}")
+
+    assert "media:" not in output.lower()
+    assert str(source) not in output
+    assert "/api/v1/agent-files/" in output
+
+
+@pytest.mark.parametrize("strict_value", [None, "0"])
+def test_disabled_or_non_strict_delivery_redacts_host_path(
+    tmp_path: Path, monkeypatch, strict_value
+):
+    source = tmp_path / "private.mp4"
+    source.write_bytes(b"video")
+    if strict_value is None:
+        monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
+        enabled = False
+    else:
+        monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", strict_value)
+        enabled = True
+    adapter = APIServerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "file_delivery": {
+                    "enabled": enabled,
+                    "public_base_url": "/api/v1/agent-files",
+                }
+            },
+        )
+    )
+
+    output = adapter._resolve_media_for_delivery(f"MEDIA:{source}")
+
+    assert str(source) not in output
+    assert "unavailable" in output.lower()
+
+
+def test_delivery_failure_redacts_host_path(tmp_path: Path, monkeypatch):
+    _enable_strict_test_media(monkeypatch, tmp_path)
+    source = tmp_path / "private.mp4"
+    source.write_bytes(b"video")
+    adapter = APIServerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "file_delivery": {
+                    "enabled": True,
+                    "public_base_url": "/api/v1/agent-files",
+                }
+            },
+        )
+    )
+    monkeypatch.setattr(
+        BasePlatformAdapter,
+        "extract_media",
+        staticmethod(lambda _text: (_ for _ in ()).throw(RuntimeError("boom"))),
+    )
+
+    output = adapter._resolve_media_for_delivery(f"MEDIA:{source}")
+
+    assert str(source) not in output
+    assert "unavailable" in output.lower()
+
+
 @pytest.mark.skipif(web is None, reason="aiohttp is not installed")
 @pytest.mark.asyncio
-async def test_download_endpoint_requires_auth_and_supports_range(tmp_path: Path):
+async def test_download_endpoint_requires_auth_and_supports_range(
+    tmp_path: Path, monkeypatch
+):
+    _enable_strict_test_media(monkeypatch, tmp_path)
     source = tmp_path / "clip.mp4"
     source.write_bytes(b"0123456789")
     adapter = APIServerAdapter(

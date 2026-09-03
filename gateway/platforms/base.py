@@ -1455,6 +1455,9 @@ def _media_delivery_denied_paths() -> List[Path]:
     _ROOT_CREDENTIAL_DIRS = (
         "pairing",
         "mcp-tokens",
+        # Contains the private source-path -> random download-id registry.
+        # Delivering this index would disclose every active artifact reference.
+        os.path.join("cache", "chat-files"),
     )
     for hermes_root in (_HERMES_HOME, _HERMES_ROOT):
         for rel in _ROOT_CREDENTIAL_FILES:
