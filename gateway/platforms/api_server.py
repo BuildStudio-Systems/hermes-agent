@@ -446,6 +446,31 @@ def _request_service_tier(model_options: Any) -> Any:
     return _REQUEST_OPTION_MISSING
 
 
+def _request_thinking_overrides(model_options: Any) -> Optional[Dict[str, Any]]:
+    """Allow only typed, request-scoped thinking controls for local templates.
+
+    Do not accept arbitrary provider overrides (URLs, credentials or tools).
+    Requests without template controls retain their existing provider defaults.
+    """
+    if not isinstance(model_options, dict):
+        return None
+    template = model_options.get("chat_template_kwargs")
+    if not isinstance(template, dict):
+        return None
+    clean = {
+        key: template[key]
+        for key in ("enable_thinking", "preserve_thinking")
+        if type(template.get(key)) is bool
+    }
+    effort = template.get("reasoning_effort")
+    if isinstance(effort, str) and effort in _REASONING_EFFORTS:
+        clean["reasoning_effort"] = effort
+    if clean.get("enable_thinking") is False:
+        clean["preserve_thinking"] = False
+        clean.pop("reasoning_effort", None)
+    return {"extra_body": {"chat_template_kwargs": clean}} if clean else None
+
+
 def _apply_runtime_agent_overrides(
     runtime_kwargs: Dict[str, Any], overrides: Optional[Dict[str, Any]]
 ) -> Dict[str, Any]:
@@ -3401,6 +3426,10 @@ class APIServerAdapter(BasePlatformAdapter):
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
+
+        thinking_overrides = _request_thinking_overrides(model_options)
+        if thinking_overrides is not None:
+            agent_kwargs["request_overrides"] = thinking_overrides
 
         agent = AIAgent(**agent_kwargs)
         agent._hermes_api_runtime = {

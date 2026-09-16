@@ -178,7 +178,8 @@ class TestAdapterInit:
         assert adapter._cors_origins == ("http://localhost:3000",)
 
 
-    def test_create_agent_forwards_runtime_config(self, monkeypatch):
+    @pytest.mark.parametrize("effort", [None, "none", "low", "medium", "xhigh"])
+    def test_create_agent_forwards_runtime_config(self, monkeypatch, effort):
         captured = {}
 
         class FakeAgent:
@@ -217,10 +218,27 @@ class TestAdapterInit:
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
 
-        agent = adapter._create_agent(session_id="api-session")
+        options = None if effort is None else {
+            "reasoning_effort": effort,
+            "chat_template_kwargs": {
+                "enable_thinking": effort != "none",
+                "preserve_thinking": effort != "none",
+                **({"reasoning_effort": effort} if effort != "none" else {}),
+            },
+        }
+        agent = adapter._create_agent(session_id="api-session", model_options=options)
 
         assert isinstance(agent, FakeAgent)
-        assert captured["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
+        assert captured["reasoning_config"] == (
+            {"enabled": False} if effort == "none"
+            else {"enabled": True, "effort": effort or "xhigh"}
+        )
+        if options is not None:
+            assert captured["request_overrides"] == {
+                "extra_body": {"chat_template_kwargs": options["chat_template_kwargs"]}
+            }
+        else:
+            assert "request_overrides" not in captured
         assert captured["checkpoints_enabled"] is True
         assert captured["checkpoint_max_snapshots"] == 7
         assert captured["checkpoint_max_total_size_mb"] == 321
