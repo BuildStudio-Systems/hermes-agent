@@ -390,6 +390,17 @@ def reset_session_vars() -> None:
         pass
 
 
+def get_bound_session_env(name: str, default: str = "") -> str:
+    """Read only this bound context, without process-env identity fallback.
+
+    Authorization of async jobs must not borrow a concurrent session's legacy
+    environment mirror when no context is bound in the calling task.
+    """
+    var = _VAR_MAP.get(name)
+    value = var.get() if var is not None else _UNSET
+    return default if value is _UNSET else value
+
+
 def get_session_env(name: str, default: str = "") -> str:
     """Read a session context variable by its legacy ``HERMES_SESSION_*`` name.
 

@@ -7545,6 +7545,7 @@ class APIServerAdapter(BasePlatformAdapter):
     @staticmethod
     def _bind_api_server_session(
         *,
+        file_owner: Optional[str] = None,
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
@@ -7570,6 +7571,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return set_session_vars(
             platform="api_server",
+            # The authenticated file owner is request-scoped, unlike a model
+            # argument or shared API token. Async media jobs need this same
+            # principal when they are submitted and later collected.
+            user_id=normalize_chat_file_owner(
+                _api_request_file_owner.get() if file_owner is None else file_owner
+            ),
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
@@ -7635,6 +7642,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # run_in_executor threads, so the profile scope must be re-entered
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
+        request_file_owner = _api_request_file_owner.get()
         request_browser_control_principal = (
             _api_request_browser_control_principal.get()
         )
@@ -7647,6 +7655,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
             with self._profile_scope(request_profile):
                 tokens = self._bind_api_server_session(
+                    file_owner=request_file_owner,
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",

@@ -59,6 +59,10 @@ def matrix_env(tmp_path, monkeypatch):
     fake_fal.submit = _submit  # type: ignore
 
     monkeypatch.setitem(__import__("sys").modules, "fal_client", fake_fal)
+    # The production loader also runs optional-dependency installation before
+    # importing. Stub that boundary, not only sys.modules, for offline tests.
+    from tools import fal_common
+    monkeypatch.setattr(fal_common, "import_fal_client", lambda: fake_fal)
 
     # httpx stub for xAI
     import httpx

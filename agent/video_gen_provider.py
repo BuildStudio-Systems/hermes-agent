@@ -151,6 +151,9 @@ class VideoGenProvider(abc.ABC):
                 "supports_seed": True,
                 "supports_upscale": True,
                 "max_reference_images": 7,
+                "async_jobs": True,                 # submit now, get_job later
+                "quality_modes": ["turbo", "standard"],
+                "default_quality": "turbo",
             }
 
         Used by the tool layer for soft validation, for capability-gated
@@ -208,6 +211,20 @@ class VideoGenProvider(abc.ABC):
         ignore it; providers that honor it should report ``upscaled: True``
         in the response ``extra``.
         """
+
+    def get_job(self, job_id: str) -> Dict[str, Any]:
+        """Read one asynchronous job when ``capabilities()['async_jobs']`` is true.
+
+        Async providers bind jobs to the trusted calling session themselves;
+        a model-supplied job id is never authorization. Implementations perform
+        one status request, and deliver completed media through the usual local
+        artifact path. Existing blocking providers need not implement this.
+        """
+        return error_response(
+            error="This video provider does not support asynchronous job lookup",
+            error_type="unsupported_operation",
+            provider=self.name,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +349,7 @@ def save_url_video(
 
 def success_response(
     *,
-    video: str,
+    video: Optional[str],
     model: str,
     prompt: str,
     modality: str = "text",
@@ -343,7 +360,8 @@ def success_response(
 ) -> Dict[str, Any]:
     """Build a uniform success response dict.
 
-    ``video`` may be an HTTP URL or an absolute filesystem path.
+    ``video`` may be an HTTP URL or an absolute filesystem path, or None
+    for an accepted asynchronous job whose status/job_id are returned in extra.
     ``modality`` is ``"text"`` (text-to-video) or ``"image"`` (image-to-video) —
     indicates which endpoint was actually hit, useful for diagnostics.
     """

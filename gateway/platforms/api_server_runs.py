@@ -696,6 +696,7 @@ async def _handle_runs(
     # Background task outlives the HTTP response (and thus the middleware
     # profile scope). Capture now and re-enter inside the task/executor.
     request_profile = _api_request_profile.get()
+    request_file_owner = _api_server._api_request_file_owner.get()
     request_browser_control_principal = (
         _api_request_browser_control_principal.get()
     )
@@ -785,6 +786,7 @@ async def _handle_runs(
                         # environment state.
                         approval_token = set_current_session_key(approval_session_key)
                         session_tokens = self._bind_api_server_session(
+                            file_owner=request_file_owner,
                             # chat_id carries the raw session id (the
                             # X-Hermes-Session-Id equivalent) exactly like
                             # the other agent-entry routes bind it via

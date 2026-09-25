@@ -285,11 +285,11 @@ def _handle_video_generate(args: Dict[str, Any], **_kw: Any) -> str:
     seed = _coerce_int(args.get("seed"))
     upscale = _coerce_bool(args.get("upscale"))
     model_override = (args.get("model") or "").strip() or None
+    job_id = args.get("job_id")
 
-    # Soft validation — providers do their own. Prompt is required by the
-    # schema; the backend may still accept image-only on its image-to-video
-    # endpoint but our surface always needs a prompt.
-    if not prompt:
+    # New generations need a prompt; capability-gated async lookups need only
+    # their existing job_id. Providers perform their own content validation.
+    if not prompt and job_id is None:
         return tool_error("prompt is required for video generation")
     if "operation" in args or "video_url" in args:
         return tool_error(
@@ -302,6 +302,15 @@ def _handle_video_generate(args: Dict[str, Any], **_kw: Any) -> str:
     provider = _resolve_active_provider()
     if provider is None:
         return _missing_provider_error(configured)
+    try:
+        caps = provider.capabilities() or {}
+    except Exception:
+        caps = {}
+    if job_id is not None:
+        if not caps.get("async_jobs"):
+            return tool_error("The configured video provider does not support job_id lookup")
+        if not isinstance(job_id, str) or not job_id.strip():
+            return tool_error("job_id must be a non-empty string")
 
     # Resolve model: explicit arg wins, then config, then provider default.
     model = model_override or _read_configured_video_model() or provider.default_model()
@@ -321,9 +330,17 @@ def _handle_video_generate(args: Dict[str, Any], **_kw: Any) -> str:
     }
     # Drop None entries so providers see clean defaults.
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
+    # Deliberately narrow extension: do not pass arbitrary model arguments to
+    # provider transports (especially owner ids, headers or endpoint URLs).
+    if caps.get("quality_modes") and "quality" in args:
+        kwargs["quality"] = args["quality"]
 
     try:
-        result = provider.generate(prompt=prompt, **kwargs)
+        result = (
+            provider.get_job(job_id.strip())
+            if job_id is not None
+            else provider.generate(prompt=prompt, **kwargs)
+        )
     except TypeError as exc:
         # A provider that hasn't widened its signature is a bug, not a
         # caller error — log and surface a clear contract message.
@@ -475,6 +492,18 @@ def _build_dynamic_video_schema() -> Dict[str, Any]:
     )
 
     # ---- description -------------------------------------------------
+    if caps.get("async_jobs"):
+        parts[0] = (
+            "Submit a video generation job with prompt, or check an existing "
+            "job with job_id only. Submission returns immediately with job_id "
+            "and status; it does not wait for rendering. A job is not a ready "
+            "video. Explain that it is queued/running and end the turn; do not "
+            "repeatedly poll or submit it again. On a later request, call this "
+            "tool with the same job_id in the originating conversation. When "
+            "completed it returns a local video path; deliver it using the "
+            "current platform's file-delivery convention. Automatic completion "
+            "notification is not provided by this tool."
+        )
     for c in _format_model_caveats(model_meta, caps):
         parts.append(f"- {c}")
 
@@ -508,6 +537,11 @@ def _build_dynamic_video_schema() -> Dict[str, Any]:
 
     # ---- params ------------------------------------------------------
     properties: Dict[str, Any] = {"prompt": static_props["prompt"]}
+    if caps.get("async_jobs"):
+        properties["job_id"] = {
+            "type": "string",
+            "description": "Check a prior job in this conversation; omit prompt and generation options.",
+        }
 
     if can_i2v:
         properties["image_url"] = {
@@ -550,6 +584,8 @@ def _build_dynamic_video_schema() -> Dict[str, Any]:
     resolution_param = dict(static_props["resolution"])
     if caps.get("resolutions"):
         resolution_param["enum"] = list(caps["resolutions"])
+        if resolution_param.get("default") not in resolution_param["enum"]:
+            resolution_param["default"] = caps.get("default_resolution", resolution_param["enum"][0])
     properties["resolution"] = resolution_param
 
     if caps.get("supports_negative_prompt"):
@@ -579,9 +615,17 @@ def _build_dynamic_video_schema() -> Dict[str, Any]:
         properties["upscale"] = {
             "type": "boolean",
             "description": (
+                caps.get("upscale_description") or
                 "High-resolution pass via the backend's video upscaler "
                 "(~2x, extra cost/latency). Omit for native resolution."
             ),
+        }
+    if caps.get("quality_modes"):
+        properties["quality"] = {
+            "type": "string",
+            "enum": list(caps["quality_modes"]),
+            "description": "Generation profile. turbo prioritizes latency; standard uses the full sampler.",
+            "default": caps.get("default_quality", caps["quality_modes"][0]),
         }
 
     properties["model"] = static_props["model"]
@@ -591,7 +635,7 @@ def _build_dynamic_video_schema() -> Dict[str, Any]:
         "parameters": {
             "type": "object",
             "properties": properties,
-            "required": ["prompt"],
+            "required": [] if caps.get("async_jobs") else ["prompt"],
         },
     }
 

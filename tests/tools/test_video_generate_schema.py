@@ -7,8 +7,8 @@ guaranteed three ways:
    declarations fails here);
 2. every FAL video family must carry the per-family keys the fal provider's
    active-model capabilities() resolution reads;
-3. declaration⇄implementation: a provider that declares seed/upscale must
-   implement it, and vice versa (source-level sweep, both directions).
+3. declared capabilities match the tool parameters at runtime; provider
+   transport tests verify that advertised options reach their backends.
 """
 import os
 import sys
@@ -40,20 +40,6 @@ CAPABILITY_AXES = (
 # Per-family keys the FAL provider's capabilities() resolution reads.
 FAL_FAMILY_KEYS = ("durations", "aspect_ratios", "resolutions", "audio",
                    "negative", "seed")
-
-
-def _plugin_sources():
-    import pathlib
-
-    plugins_dir = (pathlib.Path(__file__).resolve().parents[2]
-                   / "plugins" / "video_gen")
-    assert plugins_dir.is_dir(), plugins_dir
-    out = {}
-    for plugin in sorted(plugins_dir.iterdir()):
-        src_file = plugin / "__init__.py"
-        if src_file.is_file():
-            out[plugin.name] = src_file.read_text(encoding="utf-8")
-    return out
 
 
 class TestFleetCapabilityCoverage(unittest.TestCase):
@@ -137,39 +123,24 @@ class TestFleetCapabilityCoverage(unittest.TestCase):
         self.assertNotIn("audio", schema["parameters"]["properties"])
         self.assertIn("always on", schema["description"])
 
-    def test_declaration_matches_implementation(self):
-        """supports_seed / supports_upscale: declaration ⇄ implementation,
-        source-level, both directions, every in-tree plugin.
+    def test_declared_capabilities_match_runtime_schema(self):
+        from plugins.video_gen.buildstudio_h3 import BuildStudioH3VideoGenProvider
+        from plugins.video_gen.deepinfra import DeepInfraVideoGenProvider
+        from plugins.video_gen.fal import FALVideoGenProvider
+        from plugins.video_gen.xai import XAIVideoGenProvider
 
-        deepinfra inherits generate() from OpenAICompatibleVideoGenProvider
-        (agent/video_gen_provider.py), so its implementation source is the
-        base class file."""
-        import pathlib
-
-        base_src = (pathlib.Path(__file__).resolve().parents[2]
-                    / "agent" / "video_gen_provider.py").read_text(encoding="utf-8")
-        for name, src in _plugin_sources().items():
-            with self.subTest(provider=name):
-                impl_src = src if "def generate" in src else src + base_src
-                declares_upscale = '"supports_upscale": True' in src
-                implements_upscale = ("_upscale_video" in impl_src
-                                      or "UPSCALER_ENDPOINT" in impl_src)
-                self.assertEqual(
-                    declares_upscale, implements_upscale,
-                    f"{name}: supports_upscale declaration "
-                    f"({declares_upscale}) != implementation "
-                    f"({implements_upscale})",
-                )
-                declares_seed = '"supports_seed": True' in src
-                implements_seed = ("seed" in impl_src
-                                   and ("payload[\"seed\"]" in impl_src
-                                        or "seed: Optional[int]" in impl_src
-                                        or "\"seed\": seed" in impl_src))
-                self.assertEqual(
-                    declares_seed, implements_seed,
-                    f"{name}: supports_seed declaration ({declares_seed}) "
-                    f"!= implementation ({implements_seed})",
-                )
+        for provider_cls in (BuildStudioH3VideoGenProvider, DeepInfraVideoGenProvider,
+                             FALVideoGenProvider, XAIVideoGenProvider):
+            provider = provider_cls()
+            with self.subTest(provider=provider.name), \
+                 patch.object(vt, "_resolve_active_provider", return_value=provider), \
+                 patch.object(vt, "_read_configured_video_model", return_value="test-model"), \
+                 patch.object(provider, "list_models", return_value=[]):
+                properties = _build_dynamic_video_schema()["parameters"]["properties"]
+                capabilities = provider.capabilities()
+                for parameter in ("seed", "upscale", "audio"):
+                    self.assertEqual(parameter in properties,
+                                     bool(capabilities.get("supports_" + parameter)))
 
 
 class TestDynamicParamGating(unittest.TestCase):
