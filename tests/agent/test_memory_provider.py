@@ -1390,6 +1390,28 @@ class TestTrivialPromptClassifier:
 
         assert not is_trivial_prompt(text)
 
+    @pytest.mark.parametrize("text", [
+        "好", "好吧。", "嗯", "嗯嗯", "对的。", "是的", "行！", "可以", "没问题！",
+        "谢谢你", "辛苦了", "再见", "晚安～", "继续", "うん", "ええ。", "そうですね",
+        "分かりました。", "わかりました", "よろしくお願いします", "お願いします！",
+        "おやすみなさい", "続けて", "オッケー",
+    ])
+    def test_everyday_whole_message_replies_skip_recall(self, text):
+        from agent.memory_provider import is_trivial_prompt
+
+        assert is_trivial_prompt(text)
+
+    @pytest.mark.parametrize("text", [
+        "好久不见，最近项目怎样", "继续之前的迁移计划", "可以帮我查一下吗", "对比两个方案",
+        "行程安排是什么", "再见面时要带什么资料", "感谢信怎么写", "嗯，那个合同呢",
+        "続けて前の資料を作って", "お願いしますの使い方", "ええと、先週の件は？",
+        "よろしく伝えてと言われた", "どうもありがとう、次の件です",
+    ])
+    def test_everyday_reply_prefixes_still_recall(self, text):
+        from agent.memory_provider import is_trivial_prompt
+
+        assert not is_trivial_prompt(text)
+
     def test_trivial_variants(self):
         from agent.memory_provider import is_trivial_prompt
 
