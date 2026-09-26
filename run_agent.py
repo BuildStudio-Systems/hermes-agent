@@ -571,6 +571,9 @@ class AIAgent:
         capabilities: Dict[str, bool] | None = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
+        # Internal adapter contract, never a model option or request-body flag.
+        # Validated THERE Web chats supply the authoritative business history.
+        self._request_history_authoritative = False
         if tool_delay is not None:
             warnings.warn(
                 "tool_delay is deprecated and ignored; sequential tool calls "
@@ -9089,6 +9092,9 @@ class AIAgent:
             # process; this durable lease covers Desktop, CLI resume, gateway,
             # and background delivery processes sharing state.db (#84234).
             _turn_db = getattr(self, "_session_db", None)
+            _request_history_authoritative = (
+                getattr(self, "_request_history_authoritative", False) is True
+            )
             _durable_session_exists = False
             if _turn_db is not None and session_id:
                 try:
@@ -9123,10 +9129,12 @@ class AIAgent:
                     getattr(type(_turn_db), "acquire_session_turn_lease", None)
                 )
             ):
-                # Resumed agents also defer their create check until the turn
-                # prologue. We just proved this row exists, so suppress the
-                # redundant create attempt after acquiring it.
-                self._session_db_created = True
+                # Ordinary resumed rows are already complete. THERE admission
+                # pre-creates origin metadata only; leave its lazy create pending
+                # so the first normal flush enriches model/config/prompt fields
+                # after the prompt has actually been built.
+                if not _request_history_authoritative:
+                    self._session_db_created = True
                 _durable_holder = (
                     f"pid={os.getpid()}:turn={relay_turn_id}:platform="
                     f"{task_context['platform'] or 'unknown'}"
@@ -9227,7 +9235,9 @@ class AIAgent:
                 self._active_session_turn_lease_ttl_seconds = _lease_ttl
                 if _lease_waited:
                     self._emit_status(
-                        "Session is free; loading the latest transcript..."
+                        "Session is free; continuing with the request history..."
+                        if _request_history_authoritative
+                        else "Session is free; loading the latest transcript..."
                     )
 
                 # The holder may have compressed and rotated the session while
@@ -9236,7 +9246,10 @@ class AIAgent:
                 # Skip when acquisition was immediate — no other process held
                 # the lease, so the in-memory history is current and reloading
                 # would only cause an unnecessary prompt cache miss.
-                if _lease_waited:
+                # THERE's Web/PostgreSQL transcript remains authoritative even
+                # after waiting; this SQLite row is execution state, not a source
+                # of replacement history or a different business-session scope.
+                if _lease_waited and not _request_history_authoritative:
                     latest_session_id = _turn_db.resolve_resume_session_id(session_id)
                     if latest_session_id:
                         self.session_id = latest_session_id

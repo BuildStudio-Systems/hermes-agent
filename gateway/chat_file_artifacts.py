@@ -26,6 +26,9 @@ DEFAULT_CHAT_FILE_TTL_SECONDS = 12 * 60 * 60
 DEFAULT_CHAT_FILE_MAX_BYTES = 512 * 1024 * 1024
 _ARTIFACT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _OWNER_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_CHAT_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 
 
 def normalize_chat_file_owner(value: object) -> str:
@@ -56,6 +59,9 @@ class ChatFileArtifact:
     size_bytes: int
     mtime_ns: int
     expires_at: float
+    # Empty only for legacy links or callers without a THERE business chat.
+    # Never infer a chat from a path, prompt, or a pre-existing owner binding.
+    chat_id: str = ""
 
 
 class ChatFileArtifactStore:
@@ -97,6 +103,7 @@ class ChatFileArtifactStore:
                     CREATE TABLE IF NOT EXISTS chat_file_artifacts (
                         artifact_id TEXT PRIMARY KEY,
                         owner_id TEXT NOT NULL,
+                        chat_id TEXT NOT NULL DEFAULT '',
                         path TEXT NOT NULL,
                         filename TEXT NOT NULL,
                         content_type TEXT NOT NULL,
@@ -120,10 +127,17 @@ class ChatFileArtifactStore:
                         "ALTER TABLE chat_file_artifacts "
                         "ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''"
                     )
+                if "chat_id" not in columns:
+                    # Keep existing owner-bound links usable for their original
+                    # TTL, without guessing or claiming a business-chat owner.
+                    connection.execute(
+                        "ALTER TABLE chat_file_artifacts "
+                        "ADD COLUMN chat_id TEXT NOT NULL DEFAULT ''"
+                    )
                 connection.execute("DROP INDEX IF EXISTS chat_file_artifacts_source")
                 connection.execute(
                     "CREATE INDEX IF NOT EXISTS chat_file_artifacts_source "
-                    "ON chat_file_artifacts(owner_id, path, size_bytes, mtime_ns, expires_at)"
+                    "ON chat_file_artifacts(owner_id, chat_id, path, size_bytes, mtime_ns, expires_at)"
                 )
 
     def _prune(self, connection: sqlite3.Connection, now: float) -> None:
@@ -131,10 +145,14 @@ class ChatFileArtifactStore:
             "DELETE FROM chat_file_artifacts WHERE expires_at <= ?", (now,)
         )
 
-    def publish(self, path: str, *, owner_id: str) -> ChatFileArtifact:
+    def publish(
+        self, path: str, *, owner_id: str, chat_id: str = ""
+    ) -> ChatFileArtifact:
         owner_id = normalize_chat_file_owner(owner_id)
         if not owner_id:
             raise ChatFileArtifactNotFound("Artifact owner is invalid")
+        if not isinstance(chat_id, str) or (chat_id and not _CHAT_ID_RE.fullmatch(chat_id)):
+            raise ChatFileArtifactNotFound("Artifact chat is invalid")
         source = Path(path).resolve(strict=True)
         stat = source.stat()
         if not source.is_file():
@@ -154,11 +172,11 @@ class ChatFileArtifactStore:
                 existing = connection.execute(
                     """
                     SELECT * FROM chat_file_artifacts
-                    WHERE owner_id = ? AND path = ? AND size_bytes = ?
+                    WHERE owner_id = ? AND chat_id = ? AND path = ? AND size_bytes = ?
                       AND mtime_ns = ? AND expires_at > ?
                     ORDER BY expires_at DESC LIMIT 1
                     """,
-                    (owner_id, str(source), stat.st_size, stat.st_mtime_ns, now),
+                    (owner_id, chat_id, str(source), stat.st_size, stat.st_mtime_ns, now),
                 ).fetchone()
                 if existing is not None:
                     return self._from_row(existing)
@@ -167,13 +185,14 @@ class ChatFileArtifactStore:
                 connection.execute(
                     """
                     INSERT INTO chat_file_artifacts
-                        (artifact_id, owner_id, path, filename, content_type, size_bytes,
+                        (artifact_id, owner_id, chat_id, path, filename, content_type, size_bytes,
                          mtime_ns, expires_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         artifact_id,
                         owner_id,
+                        chat_id,
                         str(source),
                         source.name,
                         content_type,
@@ -192,6 +211,7 @@ class ChatFileArtifactStore:
             size_bytes=stat.st_size,
             mtime_ns=stat.st_mtime_ns,
             expires_at=expires_at,
+            chat_id=chat_id,
         )
 
     def resolve(self, artifact_id: str, *, owner_id: str) -> ChatFileArtifact:
@@ -238,4 +258,5 @@ class ChatFileArtifactStore:
             size_bytes=int(row["size_bytes"]),
             mtime_ns=int(row["mtime_ns"]),
             expires_at=float(row["expires_at"]),
+            chat_id=str(row["chat_id"]),
         )

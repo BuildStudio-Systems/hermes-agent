@@ -1,4 +1,4 @@
-"""AIAgent enters turns only after acquiring and reloading durable state."""
+"""AIAgent serializes turns without overriding authoritative Web history."""
 
 from __future__ import annotations
 
@@ -6,6 +6,9 @@ import sqlite3
 import threading
 import time
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from agent import relay_runtime
 from hermes_state import SessionDB
@@ -66,9 +69,12 @@ def _agent_with_db(db, *, session_id="stale-parent", platform="desktop"):
     return agent
 
 
-def test_run_conversation_acquires_then_reloads_latest_tip(monkeypatch):
+@pytest.mark.parametrize("authority", [None, False, "true", 1])
+def test_run_conversation_acquires_then_reloads_latest_tip(monkeypatch, authority):
     db = _DB()
     agent = _agent_with_db(db)
+    if authority is not None:
+        agent._request_history_authoritative = authority
     status_events = []
     agent.status_callback = lambda kind, text=None: status_events.append(
         (kind, text)
@@ -125,6 +131,103 @@ def test_run_conversation_acquires_then_reloads_latest_tip(monkeypatch):
         and "loading the latest transcript" in text
         for kind, text in status_events
     )
+
+
+@pytest.mark.parametrize("history", [[], [{"role": "assistant", "content": "Web branch"}]])
+def test_authoritative_history_keeps_lease_without_reload_or_rotation(monkeypatch, history):
+    db = _DB()
+    agent = _agent_with_db(db, session_id="there-business-session", platform="api_server")
+    agent._request_history_authoritative = True
+    agent._session_db_created = False
+    status_events = []
+    agent.status_callback = lambda kind, text=None: status_events.append((kind, text))
+
+    def acquire_with_wait(session_id, holder, **kwargs):
+        db.events.append(("acquire", session_id, holder))
+        kwargs["on_wait"](0.0)
+        return True
+
+    db.acquire_session_turn_lease = acquire_with_wait
+
+    def run_with_request_history(_agent, _message, _system, actual_history, *_args, **_kwargs):
+        assert actual_history is history
+        assert _agent.session_id == "there-business-session"
+        assert _agent._session_db_created is False
+        assert _agent._active_session_turn_lease_holder == db.events[0][2]
+        return {"final_response": "ok", "messages": actual_history, "failed": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", run_with_request_history)
+    result = agent.run_conversation("next question", conversation_history=history)
+
+    assert result["final_response"] == "ok"
+    assert [event[0] for event in db.events] == ["acquire", "release"]
+    assert db.events[0][1:] == db.events[1][1:]
+    assert agent._active_session_turn_lease_holder is None
+    messages = [text for kind, text in status_events if kind == "lifecycle" and text]
+    assert any("continuing with the request history" in text for text in messages)
+    assert not any("loading the latest transcript" in text for text in messages)
+
+
+def test_authoritative_precreated_origin_enriches_metadata_in_real_turn(tmp_path):
+    """Real constructor, conversation loop and SQLite; only provider/tool I/O is mocked."""
+    from tests.run_agent.test_run_agent import _mock_response
+
+    db = SessionDB(tmp_path / "there-execution.sqlite3")
+    session_id = "there-business-session"
+    owner_id = "synthetic-admin"
+    chat_id = "11111111-1111-4111-8111-111111111111"
+    db.create_session(session_id, "api_server", user_id=owner_id, chat_id=chat_id,
+                      session_key=session_id)
+    origin = db.get_session(session_id)
+    assert origin["model"] is None
+    assert origin["model_config"] is None
+    assert origin["system_prompt"] is None
+    agent = None
+    try:
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                model="synthetic-model", api_key="synthetic-test-key",
+                base_url="https://openrouter.ai/api/v1", quiet_mode=True,
+                skip_context_files=True, skip_memory=True, skip_background_review=True,
+                session_db=db, session_id=session_id, platform="api_server",
+                user_id=owner_id, chat_id=chat_id, gateway_session_key=session_id,
+            )
+        assert agent._request_history_authoritative is False
+        assert agent._session_db_created is False
+        agent._request_history_authoritative = True
+        agent.client = MagicMock()
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Synthetic answer", finish_reason="stop"
+        )
+        agent._use_prompt_caching = False
+        agent.compression_enabled = False
+        agent.save_trajectories = False
+        with (
+            patch.object(agent, "_build_system_prompt", return_value="Synthetic There policy."),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("Synthetic question", conversation_history=[])
+
+        assert result["final_response"] == "Synthetic answer"
+        assert agent._session_db_created is True
+        enriched = db.get_session(session_id)
+        assert enriched["model"] == "synthetic-model"
+        assert enriched["model_config"]
+        assert enriched["system_prompt"] == "Synthetic There policy."
+        assert enriched["system_prompt_hash"]
+        for field in ("source", "user_id", "chat_id", "session_key"):
+            assert enriched[field] == origin[field]
+        assert any(message["content"] == "Synthetic answer" for message in db.get_messages(session_id))
+        assert getattr(agent, "_active_session_turn_lease_holder", None) is None
+    finally:
+        if agent is not None:
+            agent.close()
+        db.close()
 
 
 def test_run_conversation_acquires_lease_when_session_probe_raises(monkeypatch):
@@ -196,9 +299,11 @@ def test_fresh_session_keeps_caller_seed_without_durable_lease(monkeypatch):
     assert db.events == []
 
 
-def test_run_conversation_lease_timeout_returns_resend_notice(monkeypatch):
+@pytest.mark.parametrize("authority", [False, True])
+def test_run_conversation_lease_timeout_returns_resend_notice(monkeypatch, authority):
     db = _DB(acquire_result=False)
     agent = _agent_with_db(db)
+    agent._request_history_authoritative = authority
     status_events = []
     agent.status_callback = lambda kind, text=None: status_events.append(
         (kind, text)
@@ -231,9 +336,11 @@ def test_run_conversation_lease_timeout_returns_resend_notice(monkeypatch):
     )
 
 
-def test_run_conversation_lease_wait_honors_interrupt(monkeypatch):
+@pytest.mark.parametrize("authority", [False, True])
+def test_run_conversation_lease_wait_honors_interrupt(monkeypatch, authority):
     db = _DB()
     agent = _agent_with_db(db)
+    agent._request_history_authoritative = authority
 
     def acquire_with_abort(session_id, holder, **kwargs):
         db.events.append(("acquire", session_id, holder))
@@ -305,9 +412,11 @@ def test_run_conversation_second_turn_after_lease_wait_abort(monkeypatch):
     assert agent._interrupt_requested is False
 
 
-def test_run_conversation_interrupts_when_lease_refresh_lost(monkeypatch):
+@pytest.mark.parametrize("authority", [False, True])
+def test_run_conversation_interrupts_when_lease_refresh_lost(monkeypatch, authority):
     db = _DB()
     agent = _agent_with_db(db)
+    agent._request_history_authoritative = authority
     agent._session_turn_lease_refresh_interval = 0.01
     interrupt_calls = []
 
@@ -355,9 +464,11 @@ def test_run_conversation_interrupts_when_lease_refresh_lost(monkeypatch):
     assert "lease lost" in str(interrupt_calls[0][0]).lower()
 
 
-def test_run_conversation_interrupts_when_lease_refresh_errors(monkeypatch):
+@pytest.mark.parametrize("authority", [False, True])
+def test_run_conversation_interrupts_when_lease_refresh_errors(monkeypatch, authority):
     db = _DB()
     agent = _agent_with_db(db)
+    agent._request_history_authoritative = authority
     agent._session_turn_lease_refresh_interval = 0.01
     interrupt_calls = []
 

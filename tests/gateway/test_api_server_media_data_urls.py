@@ -231,7 +231,7 @@ def test_streaming_resolvers_capture_request_owner(monkeypatch):
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
     resolved_owners = []
 
-    def resolve(text, *, owner_id=None):
+    def resolve(text, *, owner_id=None, chat_id=None):
         resolved_owners.append(owner_id)
         return text
 

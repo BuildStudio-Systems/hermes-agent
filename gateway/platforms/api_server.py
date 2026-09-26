@@ -59,8 +59,10 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Hashable, List, Optional
 from urllib.parse import quote
+
+from gateway.there_chat_scope import CHAT_HEADER, ThereChatScope, parse_there_chat_scope
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -98,6 +100,9 @@ _api_request_browser_control_transport_family: ContextVar[str] = ContextVar(
 _FILE_OWNER_HEADER = "X-BuildStudio-User-Id"
 _api_request_file_owner: ContextVar[str] = ContextVar(
     "api_server_file_owner", default=""
+)
+_api_request_there_chat: ContextVar[Optional[ThereChatScope]] = ContextVar(
+    "api_server_there_chat", default=None
 )
 
 #: Minimal scope shape accepted by :func:`gateway.browser_control_artifacts
@@ -1396,6 +1401,25 @@ def _release_pending_api_work(adapter, reservation: dict[str, bool]) -> None:
         adapter._pending_agent_requests = max(0, adapter._pending_agent_requests - 1)
 
 
+def _with_there_chat_scope(handler):
+    """Bind validated business identity after _admit_api_agent_request auth."""
+    @wraps(handler)
+    async def _wrapped(self, request, *args, **kwargs):
+        try:
+            scope = parse_there_chat_scope(
+                request.headers, authenticated_key_configured=bool(self._api_key)
+            )
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        token = _api_request_there_chat.set(scope)
+        try:
+            return await handler(self, request, *args, **kwargs)
+        finally:
+            _api_request_there_chat.reset(token)
+
+    return _wrapped
+
+
 @contextmanager
 def _reserve_pending_api_work(adapter):
     """Keep externally-triggered background work visible across awaits.
@@ -1465,7 +1489,7 @@ class _IdempotencyCache:
     def __init__(self, max_items: int = 1000, ttl_seconds: int = 300):
         from collections import OrderedDict
         self._store = OrderedDict()
-        self._inflight: Dict[tuple[str, str], "asyncio.Task[Any]"] = {}
+        self._inflight: Dict[tuple[Hashable, str], "asyncio.Task[Any]"] = {}
         self._ttl = ttl_seconds
         self._max = max_items
 
@@ -1477,7 +1501,7 @@ class _IdempotencyCache:
         while len(self._store) > self._max:
             self._store.popitem(last=False)
 
-    async def get_or_set(self, key: str, fingerprint: str, compute_coro):
+    async def get_or_set(self, key: Hashable, fingerprint: str, compute_coro):
         self._purge()
         item = self._store.get(key)
         if item and item["fp"] == fingerprint:
@@ -2459,19 +2483,26 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _media_resolver_for_request(self) -> _StreamingMediaResolver:
         owner_id = _api_request_file_owner.get()
+        scope = _api_request_there_chat.get()
         return _StreamingMediaResolver(
-            lambda text: self._resolve_media_for_delivery(text, owner_id=owner_id)
+            lambda text: self._resolve_media_for_delivery(
+                text, owner_id=scope.owner_id if scope else owner_id,
+                chat_id=scope.chat_id if scope else "",
+            )
         )
 
     def _resolve_media_for_delivery(
-        self, text: str, *, owner_id: Optional[str] = None
+        self, text: str, *, owner_id: Optional[str] = None, chat_id: Optional[str] = None
     ) -> str:
         """Inline small images and turn other MEDIA tags into safe links."""
         if not text or "media:" not in text.lower():
             return text
-        owner_id = self._normalize_file_owner(
-            _api_request_file_owner.get() if owner_id is None else owner_id
-        )
+        scope = _api_request_there_chat.get()
+        if owner_id is None:
+            owner_id = scope.owner_id if scope else _api_request_file_owner.get()
+        owner_id = self._normalize_file_owner(owner_id)
+        if chat_id is None:
+            chat_id = scope.chat_id if scope else ""
         if not self._file_delivery_active() or not owner_id:
             return _redact_unresolved_media_directives(text)
         try:
@@ -2485,7 +2516,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     continue
                 try:
                     artifact = self._get_chat_file_store().publish(
-                        safe_path, owner_id=owner_id
+                        safe_path, owner_id=owner_id, chat_id=chat_id
                     )
                 except ChatFileArtifactTooLarge:
                     deliveries.append("(File exceeds the download size limit)")
@@ -2555,6 +2586,10 @@ class APIServerAdapter(BasePlatformAdapter):
             },
         )
         response.content_type = artifact.content_type
+        # The Web proxy checks the still-existing PostgreSQL chat before
+        # delivering bytes. Never reflect a caller-supplied download header.
+        if artifact.chat_id:
+            response.headers[CHAT_HEADER] = artifact.chat_id
         return response
 
     # ------------------------------------------------------------------
@@ -3108,6 +3143,7 @@ class APIServerAdapter(BasePlatformAdapter):
         confirmed_runtime_lock: bool = False,
         room_dispatch: Optional[Dict[str, Any]] = None,
         room_execution_policy: Optional[Dict[str, Any]] = None,
+        there_chat_scope: Optional[ThereChatScope] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -3424,6 +3460,11 @@ class APIServerAdapter(BasePlatformAdapter):
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
         }
+        if there_chat_scope is not None:
+            agent_kwargs.update(
+                user_id=there_chat_scope.owner_id,
+                chat_id=there_chat_scope.chat_id,
+            )
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
 
@@ -3432,6 +3473,11 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_kwargs["request_overrides"] = thinking_overrides
 
         agent = AIAgent(**agent_kwargs)
+        if there_chat_scope is not None:
+            # Only this authenticated adapter can opt in. The core retains its
+            # durable turn lock, but must not replace PostgreSQL request history
+            # with a SQLite transcript after waiting for another turn.
+            agent._request_history_authoritative = True
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
@@ -5358,6 +5404,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "runtime": runtime,
         })
     @_admit_api_agent_request
+    @_with_there_chat_scope
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
         # Bound total in-flight agent runs (configurable; #7483).
@@ -5432,7 +5479,34 @@ class APIServerAdapter(BasePlatformAdapter):
         # authenticated.  Without this gate, any unauthenticated client could
         # read arbitrary session history by guessing/enumerating session IDs.
         provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
-        if provided_session_id:
+        there_chat = _api_request_there_chat.get()
+        if there_chat is not None:
+            session_id = there_chat.session_id
+            gateway_session_key = session_id
+            # New namespace: never claim a legacy fingerprint session. Read
+            # only origin metadata, NOT messages; body history stays intact.
+            try:
+                db = await self._ensure_session_db_async()
+                if db is None:
+                    raise RuntimeError("Execution state unavailable")
+                row = await asyncio.to_thread(db.get_session, session_id)
+                if row is not None and not there_chat.matches_session(row):
+                    return web.json_response(_openai_error("Execution origin conflict"), status=409)
+                if row is None:
+                    # Persist origin BEFORE tools can create artifacts/jobs.
+                    # AIAgent's lazy best-effort write alone is insufficient.
+                    await asyncio.to_thread(
+                        db.create_session, session_id, "api_server",
+                        user_id=there_chat.owner_id, chat_id=there_chat.chat_id,
+                        session_key=session_id,
+                    )
+                    row = await asyncio.to_thread(db.get_session, session_id)
+                    if row is None or not there_chat.matches_session(row):
+                        raise RuntimeError("Execution origin was not persisted")
+            except Exception:
+                logger.error("THERE execution origin persistence unavailable")
+                return web.json_response(_openai_error("Execution state unavailable"), status=503)
+        elif provided_session_id:
             if not self._api_key:
                 logger.warning(
                     "Session continuation via X-Hermes-Session-Id rejected: "
@@ -5616,6 +5690,14 @@ class APIServerAdapter(BasePlatformAdapter):
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
+            if there_chat is not None:
+                # The legacy cache is global. Namespace retries by profile,
+                # owner and saved chat so equal bodies/keys cannot share output.
+                # A tuple cannot collide with ANY caller-supplied legacy string.
+                idempotency_key = (
+                    "there-v1", _api_request_profile.get(),
+                    there_chat.session_id, idempotency_key,
+                )
             fp = _make_request_fingerprint(
                 body,
                 keys=[
@@ -7643,6 +7725,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
         request_file_owner = _api_request_file_owner.get()
+        request_there_chat = _api_request_there_chat.get()
         request_browser_control_principal = (
             _api_request_browser_control_principal.get()
         )
@@ -7655,8 +7738,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
             with self._profile_scope(request_profile):
                 tokens = self._bind_api_server_session(
-                    file_owner=request_file_owner,
-                    chat_id=session_id or "",
+                    file_owner=request_there_chat.owner_id if request_there_chat else request_file_owner,
+                    chat_id=request_there_chat.chat_id if request_there_chat else (session_id or ""),
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
                     browser_control_principal=request_browser_control_principal,
@@ -7680,6 +7763,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
+                        **({"there_chat_scope": request_there_chat} if request_there_chat else {}),
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
