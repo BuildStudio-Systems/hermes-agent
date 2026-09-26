@@ -2,8 +2,13 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
+import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from unittest.mock import MagicMock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -68,8 +73,12 @@ def coordinator(monkeypatch):
                 data = b"not JSON coordinator-test-secret"
             self.send_response(200)
             self.send_header("Content-Type", state["mime"] if content else "application/json")
-            self.send_header("Content-Length", str(len(data)))
+            if not content or not state.get("omit_content_length"):
+                self.send_header("Content-Length", str(len(data)))
             self.end_headers()
+            if content and state.get("content_started") is not None:
+                state["content_started"].set()
+                assert state["release_content"].wait(10)
             self.wfile.write(data)
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -112,6 +121,186 @@ def test_completed_job_downloads_authenticated_fixed_content_path(coordinator, t
     assert path.is_relative_to(tmp_path) and path.read_bytes() == coordinator["content"]
     assert coordinator["calls"][-1][:3] == ("GET", "/v1/videos/video-1/content", "user-1")
     assert "private-host" not in json.dumps(result) and "coordinator-test-secret" not in json.dumps(result)
+
+
+def test_completed_queries_reuse_one_download_across_provider_instances(coordinator, tmp_path):
+    coordinator["content"] = b"\x00\x00\x00\x18ftypmp42" + b"v" * (2 * 1024 * 1024)
+    h3.BuildStudioH3VideoGenProvider().generate("private prompt")
+    coordinator["status"] = "completed"
+    results = [h3.BuildStudioH3VideoGenProvider().get_job("video-1") for _ in range(5)]
+    assert all(result["success"] for result in results)
+    assert len({result["video"] for result in results}) == 1
+    assert len(list(tmp_path.rglob("*.mp4"))) == 1
+    assert sum(call[1].endswith("/content") for call in coordinator["calls"]) == 1
+    assert sum(call[1] == "/v1/videos/video-1" for call in coordinator["calls"]) == 5
+    receipt = next(tmp_path.rglob("video-1.json")).read_text()
+    assert "coordinator-test-secret" not in receipt and "private prompt" not in receipt
+
+
+def test_completed_download_cache_survives_fresh_process(coordinator):
+    provider = h3.BuildStudioH3VideoGenProvider()
+    provider.generate("video")
+    coordinator["status"] = "completed"
+    first = provider.get_job("video-1")
+    script = """
+import json
+from gateway.session_context import set_session_vars
+from plugins.video_gen.buildstudio_h3 import BuildStudioH3VideoGenProvider
+set_session_vars(platform='api_server', user_id='user-1', chat_id='chat-1', session_id='new-turn')
+print(json.dumps(BuildStudioH3VideoGenProvider().get_job('video-1')))
+"""
+    child_env = dict(os.environ, BUILDSTUDIO_H3_BASE_URL=coordinator["base_url"])
+    completed = subprocess.run([sys.executable, "-c", script], env=child_env,
+                               capture_output=True, text=True, timeout=20, check=True)
+    result = json.loads(completed.stdout)
+    assert result["success"] and result["video"] == first["video"]
+    assert sum(call[1].endswith("/content") for call in coordinator["calls"]) == 1
+
+
+@pytest.mark.parametrize("change", ["missing", "modified", "hardlinked"])
+def test_missing_or_changed_cached_video_is_downloaded_again(coordinator, tmp_path, change):
+    provider = h3.BuildStudioH3VideoGenProvider()
+    provider.generate("video")
+    coordinator["status"] = "completed"
+    first = Path(provider.get_job("video-1")["video"])
+    if change == "missing":
+        first.unlink()
+    elif change == "modified":
+        first.write_bytes(b"unexpected replacement")
+        info = first.stat()
+        os.utime(first, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000))
+    else:
+        os.link(first, tmp_path / "other-owner-file.mp4")
+    second = provider.get_job("video-1")
+    assert second["success"] and Path(second["video"]) != first
+    assert Path(second["video"]).read_bytes() == coordinator["content"]
+    assert sum(call[1].endswith("/content") for call in coordinator["calls"]) == 2
+
+
+@pytest.mark.parametrize("name", [
+    "../../private.mp4", "C:/private.mp4", "private.mp4",
+    "buildstudio_h3_" + "0" * 64 + "_otherjob.mp4",
+])
+def test_cache_metadata_cannot_supply_an_arbitrary_file_path(coordinator, tmp_path, name):
+    provider = h3.BuildStudioH3VideoGenProvider()
+    provider.generate("video")
+    coordinator["status"] = "completed"
+    first = provider.get_job("video-1")
+    receipt = next(tmp_path.rglob("video-1.json"))
+    data = json.loads(receipt.read_text())
+    data["delivery"]["name"] = name
+    receipt.write_text(json.dumps(data))
+    result = provider.get_job("video-1")
+    assert result["success"] and result["video"] != first["video"]
+    assert Path(result["video"]).read_bytes() == coordinator["content"]
+
+
+@pytest.mark.parametrize("status", [404, 307])
+def test_cached_video_still_requires_online_authorization(coordinator, status):
+    provider = h3.BuildStudioH3VideoGenProvider()
+    provider.generate("video")
+    coordinator["status"] = "completed"
+    assert provider.get_job("video-1")["success"]
+    coordinator["response_status"] = status
+    result = provider.get_job("video-1")
+    assert result["success"] is False and not result.get("video")
+    assert coordinator["calls"][-1][1] == "/v1/videos/video-1"
+    assert sum(call[1].endswith("/content") for call in coordinator["calls"]) == 1
+
+
+def test_cached_video_does_not_cross_coordinator_configuration(coordinator, monkeypatch):
+    provider = h3.BuildStudioH3VideoGenProvider()
+    provider.generate("video")
+    coordinator["status"] = "completed"
+    first = provider.get_job("video-1")
+    monkeypatch.setattr(provider, "_default_base_url", coordinator["base_url"] + "/changed")
+    second = provider.get_job("video-1")
+    assert second["success"] and second["video"] != first["video"]
+    assert sum(call[1].endswith("/content") for call in coordinator["calls"]) == 2
+
+
+@pytest.mark.parametrize("user,chat", [("user-2", "chat-1"), ("user-1", "chat-2")])
+def test_cached_video_remains_bound_to_original_user_and_conversation(coordinator, user, chat):
+    provider = h3.BuildStudioH3VideoGenProvider()
+    provider.generate("video")
+    coordinator["status"] = "completed"
+    assert provider.get_job("video-1")["success"]
+    original_calls = len(coordinator["calls"])
+    tokens = set_session_vars(platform="api_server", user_id=user, chat_id=chat)
+    try:
+        result = provider.get_job("video-1")
+    finally:
+        clear_session_vars(tokens)
+    assert result["success"] is False and not result.get("video")
+    assert len(coordinator["calls"]) == original_calls
+
+
+def test_concurrent_completed_queries_do_not_duplicate_or_wait_for_download(coordinator):
+    provider = h3.BuildStudioH3VideoGenProvider()
+    provider.generate("video")
+    coordinator.update(status="completed", content_started=threading.Event(), release_content=threading.Event())
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(copy_context().run, provider.get_job, "video-1")
+        try:
+            assert coordinator["content_started"].wait(5)
+            second = h3.BuildStudioH3VideoGenProvider().get_job("video-1")
+            assert second["success"] and second["video"] is None
+            assert "being collected" in second["message"]
+        finally:
+            coordinator["release_content"].set()
+        first_result = first.result(timeout=5)
+    third = provider.get_job("video-1")
+    assert first_result["success"] and third["video"] == first_result["video"]
+    assert sum(call[1].endswith("/content") for call in coordinator["calls"]) == 1
+
+
+def test_failed_cache_publication_cleans_up_video_and_can_retry(coordinator, tmp_path, monkeypatch):
+    provider = h3.BuildStudioH3VideoGenProvider()
+    provider.generate("video")
+    coordinator["status"] = "completed"
+    with monkeypatch.context() as patcher:
+        patcher.setattr(h3, "remember_delivery", MagicMock(side_effect=OSError("disk full private-path")))
+        result = provider.get_job("video-1")
+    assert not result["success"] and not list(tmp_path.rglob("*.mp4"))
+    assert "private-path" not in json.dumps(result)
+    assert provider.get_job("video-1")["success"]
+
+
+def test_unknown_content_size_still_enforces_stream_limit(coordinator, tmp_path, monkeypatch):
+    provider = h3.BuildStudioH3VideoGenProvider()
+    provider.generate("video")
+    coordinator.update(status="completed", omit_content_length=True)
+    monkeypatch.setattr(provider, "_max_video_bytes", 2)
+    assert provider.get_job("video-1")["success"] is False
+    assert not list(tmp_path.rglob("*.mp4"))
+
+
+def test_atomic_receipt_failure_preserves_ownership_and_removes_temporary_file(coordinator, tmp_path, monkeypatch):
+    from plugins.video_gen.buildstudio_h3 import jobs
+
+    provider = h3.BuildStudioH3VideoGenProvider()
+    provider.generate("video")
+    receipt = next(tmp_path.rglob("video-1.json"))
+    original = receipt.read_bytes()
+    coordinator["status"] = "completed"
+    with monkeypatch.context() as patcher:
+        patcher.setattr(jobs.os, "replace", MagicMock(side_effect=OSError("disk full")))
+        assert provider.get_job("video-1")["success"] is False
+    assert receipt.read_bytes() == original
+    assert not list(tmp_path.rglob("*.tmp")) and not list(tmp_path.rglob("*.mp4"))
+    assert provider.get_job("video-1")["success"]
+
+
+def test_delivery_lock_is_nonblocking_and_scoped_to_job_and_profile(tmp_path, monkeypatch):
+    from plugins.video_gen.buildstudio_h3.jobs import delivery_lock
+
+    with delivery_lock("video-1") as first:
+        assert first
+        with delivery_lock("video-1") as duplicate, delivery_lock("video-2") as other:
+            assert not duplicate and other
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "other-profile"))
+        with delivery_lock("video-1") as other_profile:
+            assert other_profile
 
 
 @pytest.mark.parametrize("user,chat", [("user-2", "chat-1"), ("user-1", "chat-2")])

@@ -14,6 +14,7 @@ there. This file pins the asymmetry.
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from urllib.parse import quote
 
 import pytest
 
@@ -95,7 +96,7 @@ async def test_bare_local_path_in_streamed_reply_is_not_uploaded(tmp_path, monke
 @pytest.mark.asyncio
 async def test_explicit_media_tag_still_delivers_post_stream(tmp_path, monkeypatch):
     """Explicit MEDIA: directives keep working after the #20834 fix."""
-    media_file = _allowed_media_path(tmp_path, monkeypatch, "chart.png")
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "chart # 1.png")
     adapter = _adapter()
 
     await GatewayRunner._deliver_media_from_response(
@@ -108,6 +109,7 @@ async def test_explicit_media_tag_still_delivers_post_stream(tmp_path, monkeypat
     adapter.send_multiple_images.assert_awaited_once()
     images_kwargs = adapter.send_multiple_images.await_args.kwargs
     assert images_kwargs["chat_id"] == "C123CHAN"
-    assert str(media_file) in images_kwargs["images"][0][0]
-
+    # The adapter's file:// convention percent-encodes the full native path;
+    # compare the exact payload rather than searching for unescaped text.
+    assert images_kwargs["images"][0][0] == f"file://{quote(str(media_file))}"
 

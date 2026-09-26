@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import tempfile
@@ -15,7 +16,10 @@ from agent.video_gen_provider import (
     DEFAULT_ASPECT_RATIO, DEFAULT_RESOLUTION, OpenAICompatibleVideoGenProvider,
     _videos_cache_dir, error_response, success_response,
 )
-from .jobs import current_scope, owned_receipt, save_receipt, validate_job_id
+from .jobs import (
+    cached_delivery, current_scope, delivery_lock, delivery_prefix, owned_receipt,
+    remember_delivery, save_receipt, validate_job_id,
+)
 
 
 class _H3ResponseError(ValueError):
@@ -210,14 +214,22 @@ class BuildStudioH3VideoGenProvider(OpenAICompatibleVideoGenProvider):
             # bodies. Do not send these into model context or ordinary logs.
             return self._error("H3 submission could not be confirmed; do not automatically resubmit", "submission_unconfirmed")
 
-    def _download(self, job_id: str, owner: str) -> Path:
+    def _download(self, job_id: str, owner: str, scope: str) -> Path:
         deadline = time.monotonic() + self._content_deadline_s
         path = None
         try:
             with self._request("GET", "/videos/" + job_id + "/content", owner, stream=True) as response:
                 if response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "video/mp4":
                     raise ValueError("H3 result is not an MP4 video")
-                descriptor, filename = tempfile.mkstemp(prefix="buildstudio_h3_", suffix=".mp4", dir=_videos_cache_dir())
+                declared_size = response.headers.get("Content-Length")
+                if declared_size is not None:
+                    try:
+                        declared_size = int(declared_size)
+                    except ValueError:
+                        raise ValueError("H3 returned an invalid video size") from None
+                    if not 0 < declared_size <= self._max_video_bytes:
+                        raise ValueError("H3 video delivery exceeded its size limit or is empty")
+                descriptor, filename = tempfile.mkstemp(prefix=delivery_prefix(job_id, scope), suffix=".mp4", dir=_videos_cache_dir())
                 path = Path(filename)
                 total = 0
                 with os.fdopen(descriptor, "wb") as stream:
@@ -245,7 +257,21 @@ class BuildStudioH3VideoGenProvider(OpenAICompatibleVideoGenProvider):
                 raise ValueError("H3 returned a different video job")
             result = self._status_result(job, options)
             if job["status"] == "completed":
-                path = self._download(job_id, owner)
+                # Authorization/status always comes from the coordinator first;
+                # cache reuse is not permission to read a revoked job offline.
+                source = hashlib.sha256(self._base_url().rstrip("/").encode()).hexdigest()
+                with delivery_lock(job_id) as acquired:
+                    if not acquired:
+                        result["message"] = "Video is being collected by another request. Query this job_id later."
+                        return result
+                    path = cached_delivery(job_id, scope, source, self._max_video_bytes)
+                    if path is None:
+                        path = self._download(job_id, owner, scope)
+                        try:
+                            remember_delivery(job_id, scope, source, path)
+                        except Exception:
+                            path.unlink(missing_ok=True)
+                            raise
                 result.update(video=str(path), upscaled=options["size"] in {"2560x1440", "1440x2560"},
                               message="Video ready. Deliver the local video through the platform file-delivery convention.")
             return result
