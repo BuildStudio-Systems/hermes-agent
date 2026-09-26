@@ -1367,6 +1367,29 @@ class TestMemoryInjectionRejectsMalformedSchema:
 class TestTrivialPromptClassifier:
     """is_trivial_prompt — the shared gate for core prefetch + provider injection."""
 
+    @pytest.mark.parametrize("text", [
+        "你好", "您好！", "谢谢。", "多谢", "收到", "好的", "明白了！",
+        "知道了", "こんにちは", "こんばんは。", "おはようございます！",
+        "ありがとう", "ありがとうございます。", "了解しました", "承知しました",
+        "はい。", "いいえ", "Hello！", "Thanks。",
+    ])
+    def test_chinese_japanese_and_fullwidth_punctuation(self, text):
+        from agent.memory_provider import is_trivial_prompt
+
+        assert is_trivial_prompt(text)
+
+    @pytest.mark.parametrize("text", [
+        "你好，请查我的项目", "您好，昨天讨论了什么？", "谢谢，继续之前的方案",
+        "好的项目有哪些", "收到的文件在哪里", "明白了吗？",
+        "こんにちは、私のプロジェクトを探して", "ありがとうございます。前の案を確認して",
+        "はい、先週の計画を教えて", "了解した内容を説明して", "ありがとうの意味は？",
+        "Hello！What did we decide yesterday?",
+    ])
+    def test_multilingual_semantic_queries_still_recall(self, text):
+        from agent.memory_provider import is_trivial_prompt
+
+        assert not is_trivial_prompt(text)
+
     def test_trivial_variants(self):
         from agent.memory_provider import is_trivial_prompt
 

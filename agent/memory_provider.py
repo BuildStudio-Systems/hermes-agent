@@ -77,12 +77,17 @@ class RecallStatus:
 # The alternation is anchored and may only be followed by whitespace or
 # punctuation, so words that merely START with a trivial word ("k8s", "yolo",
 # "note", "hindsight") do NOT match, while trailing-punctuation variants
-# ("hi!", "hey.", "thanks :)", "done???") do.
+# ("hi!", "hey.", "thanks :)", "done???") do. Chinese/Japanese
+# greetings follow the same whole-message rule: "你好，请查我的项目" must
+# still recall memory. Do not use a language-wide or prefix-based shortcut.
 TRIVIAL_PROMPT_RE = re.compile(
     r'^(yes|no|ok|okay|sure|thanks|thank you|y|n|yep|nope|yeah|nah|'
     r'hi|hey|hello|yo|sup|'
-    r'continue|go ahead|do it|proceed|got it|cool|nice|great|done|next|lgtm|k)'
-    r'[\s!?.:;,"' + "'" + r'~\u2018\u2019\u201c\u201d\u2014\u2013\u2026()\[\]{}<>*&^%$#@!+=`\u00a0]*$',
+    r'continue|go ahead|do it|proceed|got it|cool|nice|great|done|next|lgtm|k|'
+    r'你好|您好|谢谢|多谢|收到|好的|明白了|知道了|'
+    r'こんにちは|こんばんは|おはよう(?:ございます)?|ありがとう(?:ございます)?|'
+    r'了解(?:しました)?|承知しました|はい|いいえ)'
+    r'[\s!?.:;,"' + "'" + r'~\u2018\u2019\u201c\u201d\u2014\u2013\u2026()\[\]{}<>*&^%$#@!+=`\u00a0。！？、，：；〜「」『』（）【】]*$',
     re.IGNORECASE,
 )
 

@@ -284,6 +284,33 @@ def test_prefetch_skipped_for_trivial_user_message():
     assert ctx.ext_prefetch_cache == ""
 
 
+@pytest.mark.parametrize("message", ["你好！", "谢谢。", "こんにちは", "ありがとうございます。"])
+def test_multilingual_greeting_does_not_wait_for_memory(message):
+    agent, mm = _agent_with_memory_manager()
+    history = [
+        {"role": "user", "content": "Earlier substantive question"},
+        {"role": "assistant", "content": "Earlier answer"},
+    ]
+    ctx = _build(agent, user_message=message, conversation_history=history)
+    mm.prefetch_all.assert_not_called()
+    assert ctx.ext_prefetch_cache == ""
+    assert ctx.messages[:-1] == history
+    assert ctx.messages[-1]["content"] == message
+    assert agent._cached_system_prompt == "SYSTEM"
+
+
+@pytest.mark.parametrize("message", [
+    "你好，之前我的项目决定是什么？", "こんにちは、前に決めた計画は何ですか？",
+])
+def test_multilingual_question_keeps_memory_and_history(message):
+    agent, mm = _agent_with_memory_manager()
+    ctx = _build(agent, user_message=message)
+    mm.prefetch_all.assert_called_once_with(message)
+    assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
+    assert ctx.messages[-1]["content"] == message
+    assert "REMEMBERED CONTEXT" in ctx.messages[-1]["api_content"]
+
+
 def test_prefetch_runs_for_substantive_user_message():
     agent, mm = _agent_with_memory_manager()
     query = "what did we decide about the deploy pipeline?"
