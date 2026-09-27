@@ -405,10 +405,15 @@ def _moa_client_consumes_prepared_request(client: Any) -> bool:
     return callable(getattr(completions, "prepare", None))
 
 
-def _join_truncated_parts(parts: List[str]) -> str:
+def _join_truncated_parts(parts: List[str], *, replay_boundaries=()) -> str:
     """Join continuation fragments, adding a newline where two would glue together (#78577)."""
     joined = ""
-    for part in parts:
+    for index, part in enumerate(parts):
+        if index in replay_boundaries:
+            # Network continuations may restart instead of following the
+            # nudge. Only this explicit boundary permits exact-prefix removal.
+            joined = part if joined and part.startswith(joined) else joined + part
+            continue
         if joined and not joined[-1].isspace() and part and not part[0].isspace():
             joined += "\n"
         joined += part
@@ -2095,6 +2100,10 @@ def run_conversation(
     _outer_error_count = 0
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
+    truncated_replay_boundaries = set()
+    agent._stream_recovery_pending = False
+    agent._stream_replay_filter = None
+    agent._stream_visible_response = ""
     compression_attempts = 0
     # One resolved per-turn compression attempt cap, shared by every site that
     # consumes ``compression_attempts``: the pre-API pressure gate, the
@@ -4099,6 +4108,7 @@ def run_conversation(
                                 agent._session_messages = messages
                                 length_continue_retries = 0
                                 truncated_response_parts = []
+                                truncated_replay_boundaries.clear()
                                 retry_count = 0
                                 compression_attempts = 0
                                 _retry.primary_recovery_attempted = False
@@ -4169,6 +4179,9 @@ def run_conversation(
                                 _continue_content = _get_continuation_prompt(
                                     _is_partial_stream_stub, _dropped_tools
                                 )
+                                if _is_partial_stream_stub and not _dropped_tools:
+                                    agent._stream_recovery_pending = True
+                                    truncated_replay_boundaries.add(len(truncated_response_parts))
                                 continue_msg = {
                                     "role": "user",
                                     "content": _continue_content,
@@ -4179,7 +4192,9 @@ def run_conversation(
                                 _retry.restart_with_length_continuation = True
                                 break
 
-                            partial_response = agent._strip_think_blocks(_join_truncated_parts(truncated_response_parts)).strip()
+                            partial_response = agent._strip_think_blocks(_join_truncated_parts(
+                                truncated_response_parts, replay_boundaries=truncated_replay_boundaries
+                            )).strip()
                             if partial_response:
                                 agent._vprint(
                                     f"{agent.log_prefix}⚠️  Response still truncated "
@@ -8480,8 +8495,12 @@ def run_conversation(
                 codex_ack_continuations = 0
 
                 if truncated_response_parts:
-                    final_response = _join_truncated_parts([*truncated_response_parts, final_response])
+                    final_response = _join_truncated_parts(
+                        [*truncated_response_parts, final_response],
+                        replay_boundaries=truncated_replay_boundaries,
+                    )
                     truncated_response_parts = []
+                    truncated_replay_boundaries.clear()
                     length_continue_retries = 0
                     # The continuation recovered, so the fragments stay in the transcript.
                     for _frag in messages:

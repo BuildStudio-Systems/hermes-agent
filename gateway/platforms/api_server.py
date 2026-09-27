@@ -1297,7 +1297,11 @@ class _StreamingMediaResolver:
                     break
                 line = self._buffer[: newline + 1]
                 self._buffer = self._buffer[newline + 1 :]
-                output.append(self._resolver(line))
+                # The publisher trims trailing whitespace. Preserve the
+                # directive's original line boundary so adjacent attachments
+                # and following prose do not collapse into one Markdown line.
+                ending = "\r\n" if line.endswith("\r\n") else "\n"
+                output.append(self._resolver(line).rstrip("\r\n") + ending)
                 self._holding_media = False
                 continue
 

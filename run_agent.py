@@ -6932,13 +6932,7 @@ class AIAgent:
                 if ctx_scrubber is not None:
                     think_tail = ctx_scrubber.feed(think_tail)
                 if think_tail:
-                    callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-                    for cb in callbacks:
-                        try:
-                            cb(think_tail)
-                        except Exception:
-                            pass
-                    self._record_streamed_assistant_text(think_tail)
+                    self._deliver_visible_stream_text(think_tail)
         # Flush any benign partial-tag tail held by the context scrubber so it
         # reaches the UI before we clear state for the next model call.  If
         # the scrubber is mid-span, flush() drops the orphaned content.
@@ -6946,14 +6940,39 @@ class AIAgent:
         if scrubber is not None:
             tail = scrubber.flush()
             if tail:
-                callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-                for cb in callbacks:
-                    try:
-                        cb(tail)
-                    except Exception:
-                        pass
-                self._record_streamed_assistant_text(tail)
+                self._deliver_visible_stream_text(tail)
+        if getattr(self, "_stream_recovery_pending", False):
+            from agent.stream_replay import StreamReplayPrefix
+            self._stream_replay_filter = StreamReplayPrefix(
+                getattr(self, "_stream_visible_response", "")
+            )
+        else:
+            self._stream_replay_filter = None
+            self._stream_visible_response = ""
+        self._stream_recovery_pending = False
         self._current_streamed_assistant_text = ""
+
+    def _deliver_visible_stream_text(self, text: str) -> str:
+        """Keep raw attempt tracking, but do not replay a recovered prefix."""
+        if self._stream_writer_superseded():
+            return ""
+        raw_text = text
+        replay = getattr(self, "_stream_replay_filter", None)
+        if replay is not None:
+            text = replay.feed(text)
+        callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
+        delivered = False
+        for cb in callbacks:
+            try:
+                if text:
+                    cb(text)
+                delivered = True
+            except Exception:
+                pass
+        if delivered:
+            self._record_streamed_assistant_text(raw_text)
+            self._stream_visible_response = getattr(self, "_stream_visible_response", "") + text
+        return text
 
     def _record_streamed_assistant_text(self, text: str) -> None:
         """Accumulate visible assistant text emitted through stream callbacks."""
@@ -7320,14 +7339,9 @@ class AIAgent:
                 text = text.lstrip("\n")
         if not text:
             return
-        callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-        delivered = False
-        for cb in callbacks:
-            try:
-                cb(text)
-                delivered = True
-            except Exception:
-                pass
+        text = self._deliver_visible_stream_text(text)
+        if not text:
+            return
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 
@@ -7339,8 +7353,6 @@ class AIAgent:
             )
         except Exception:
             logger.debug("on_stream_delta plugin hook enqueue failed", exc_info=True)
-        if delivered:
-            self._record_streamed_assistant_text(text)
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""

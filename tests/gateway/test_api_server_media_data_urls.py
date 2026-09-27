@@ -132,6 +132,43 @@ def test_streaming_resolver_holds_lowercase_media_path():
     assert "".join(chunks) == "Ready. [download](/safe/file)"
 
 
+@pytest.mark.parametrize("chunk_size", [1, 5, 17, 4096])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_multiple_streamed_attachments_keep_line_boundaries(
+    tmp_path: Path, monkeypatch, chunk_size, newline
+):
+    """Use the real publisher, whose resolved Markdown strips trailing space."""
+    _enable_strict_test_media(monkeypatch, tmp_path)
+    sources = [tmp_path / "zh-check.txt", tmp_path / "ja-check.txt"]
+    for source in sources:
+        source.write_bytes(b"synthetic attachment\n")
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={
+        "file_delivery": {"enabled": True, "public_base_url": "/api/v1/agent-files"}
+    }))
+    store = ChatFileArtifactStore(tmp_path / "artifacts.sqlite3")
+    adapter._get_chat_file_store = lambda: store
+    resolver = _StreamingMediaResolver(
+        lambda value: adapter._resolve_media_for_delivery(value, owner_id="user-1")
+    )
+    original = newline.join([
+        "Ready.", f"MEDIA:{sources[0]}", f"MEDIA:{sources[1]}",
+        "Repeated prose is valid. Repeated prose is valid.",
+    ])
+    chunks = []
+    for offset in range(0, len(original), chunk_size):
+        chunks.extend(resolver.feed(original[offset:offset + chunk_size]))
+    chunks.extend(resolver.finish())
+    output = "".join(chunks)
+    assert str(tmp_path) not in output
+    assert "MEDIA:" not in output
+    links = re.findall(r"\[Download [^\n]+?\]\(/api/v1/agent-files/[^)]+\)", output)
+    assert len(links) == 2
+    assert output == newline.join([
+        "Ready.", *links, "Repeated prose is valid. Repeated prose is valid.",
+    ])
+    assert resolver.finish() == []
+
+
 def test_lowercase_extensionless_media_becomes_download_link(
     tmp_path: Path, monkeypatch
 ):
