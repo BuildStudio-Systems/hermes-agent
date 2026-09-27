@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
@@ -79,6 +81,72 @@ def test_default_repeated_identical_failed_call_warns_without_blocking():
     assert {d.code for d in decisions[1:]} == {"repeated_exact_failure_warning"}
     assert controller.before_call("web_search", args).action == "allow"
     assert controller.halt_decision is None
+
+
+def test_total_failure_budget_survives_successful_diagnostics_and_tool_changes():
+    controller = ToolCallGuardrailController(ToolCallGuardrailConfig.from_mapping({
+        "hard_stop_enabled": True,
+        "hard_stop_after": {"total_failure": 3},
+    }))
+    for index, tool in enumerate(("terminal", "read_file", "terminal"), 1):
+        assert controller.before_call(tool, {"attempt": index}).allows_execution
+        decision = controller.after_call(tool, {"attempt": index}, "Error: synthetic", failed=True)
+        if index < 3:
+            assert not decision.should_halt
+            controller.after_call("terminal", {"command": "pwd"}, "ok", failed=False)
+    assert decision.code == "total_tool_failure_halt"
+    assert decision.count == 3
+    # The rest of an already emitted sequential batch must not run either.
+    blocked = controller.before_call("write_file", {"path": "not-created"})
+    assert not blocked.allows_execution
+    assert blocked.should_halt
+    controller.after_call("terminal", {}, "ok", failed=False)
+    assert not controller.before_call("terminal", {}).allows_execution
+    controller.reset_for_turn()
+    assert controller.before_call("terminal", {}).allows_execution
+    assert not controller.after_call("terminal", {}, "Error", failed=True).should_halt
+
+
+@pytest.mark.parametrize("enabled,limit", [(False, 2), (True, 0)])
+def test_total_failure_budget_respects_opt_out(enabled, limit):
+    controller = ToolCallGuardrailController(ToolCallGuardrailConfig.from_mapping({
+        "hard_stop_enabled": enabled,
+        "hard_stop_after": {"total_failure": limit},
+    }))
+    for index in range(15):
+        assert controller.before_call("terminal", {"attempt": index}).allows_execution
+        assert not controller.after_call("terminal", {"attempt": index}, "Error", failed=True).should_halt
+        controller.after_call("terminal", {"command": "pwd"}, "ok", failed=False)
+
+
+def test_total_failure_budget_parses_nested_and_flat_settings():
+    assert ToolCallGuardrailConfig.from_mapping({"hard_stop_after": {"total_failure": 4}}).total_failure_halt_after == 4
+    assert ToolCallGuardrailConfig.from_mapping({"total_failure_halt_after": 6}).total_failure_halt_after == 6
+    for invalid in (-1, "invalid", None):
+        assert ToolCallGuardrailConfig.from_mapping({"total_failure_halt_after": invalid}).total_failure_halt_after == 12
+
+
+def test_failure_budget_loads_from_isolated_profile_without_changing_yaml(tmp_path, monkeypatch):
+    from hermes_cli.config import load_config_readonly
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    profile = tmp_path / "config.yaml"
+    original = (
+        "tool_loop_guardrails:\n"
+        "  hard_stop_enabled: true\n"
+        "  hard_stop_after:\n"
+        "    total_failure: 2\n"
+    ).encode("utf-8")
+    profile.write_bytes(original)
+    loaded = load_config_readonly()
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig.from_mapping(loaded["tool_loop_guardrails"])
+    )
+    controller.after_call("terminal", {"command": "fail-1"}, '{"exit_code":1}')
+    controller.after_call("terminal", {"command": "diagnose"}, '{"exit_code":0}')
+    decision = controller.after_call("terminal", {"command": "fail-2"}, '{"exit_code":1}')
+    assert decision.code == "total_tool_failure_halt"
+    assert profile.read_bytes() == original
 
 
 def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution():
@@ -167,8 +235,6 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
     assert decision.should_halt is True
-
-
 
 
 

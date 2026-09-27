@@ -120,6 +120,9 @@ class ToolCallGuardrailConfig:
     exact_failure_block_after: int = 5
     same_tool_failure_warn_after: int = 3
     same_tool_failure_halt_after: int = 8
+    # Cumulative across tools and intervening successes. Only active with
+    # hard_stop_enabled; 0 disables this budget for long interactive work.
+    total_failure_halt_after: int = 12
     no_progress_warn_after: int = 2
     no_progress_block_after: int = 5
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
@@ -162,6 +165,10 @@ class ToolCallGuardrailConfig:
             same_tool_failure_halt_after=_positive_int(
                 hard_stop_after.get("same_tool_failure", data.get("same_tool_failure_halt_after")),
                 defaults.same_tool_failure_halt_after,
+            ),
+            total_failure_halt_after=_non_negative_int(
+                hard_stop_after.get("total_failure", data.get("total_failure_halt_after")),
+                defaults.total_failure_halt_after,
             ),
             no_progress_block_after=_positive_int(
                 hard_stop_after.get("idempotent_no_progress", data.get("no_progress_block_after")),
@@ -340,6 +347,8 @@ class ToolCallGuardrailController:
     def reset_for_turn(self) -> None:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
+        self._total_failure_count = 0
+        self._total_failure_halt: ToolGuardrailDecision | None = None
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
         self._halt_decision: ToolGuardrailDecision | None = None
         # Identical-call loop-breaker state (agent.stall_guards): tracks the
@@ -374,6 +383,12 @@ class ToolCallGuardrailController:
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+
+        # A successful diagnostic or a different tool must not reopen a turn
+        # whose cumulative failure budget is exhausted. Already-running calls
+        # may finish; later dispatches are refused without consuming caps.
+        if self._total_failure_halt is not None:
+            return self._total_failure_halt
 
         # ── Per-turn runaway-loop caps ──────────────────────────────────
         # These are hard ceilings on how many times a runaway-prone tool may
@@ -440,7 +455,28 @@ class ToolCallGuardrailController:
         if failed is None:
             failed, _ = classify_tool_failure(tool_name, result)
 
+        if self._total_failure_halt is not None:
+            return self._total_failure_halt
+
         if failed:
+            self._total_failure_count += 1
+            limit = self.config.total_failure_halt_after
+            if self.config.hard_stop_enabled and limit and self._total_failure_count >= limit:
+                decision = ToolGuardrailDecision(
+                    action="halt",
+                    code="total_tool_failure_halt",
+                    message=(
+                        f"Stopped after {self._total_failure_count} failed tool attempts this turn, "
+                        "including failures separated by successful diagnostics. "
+                        "Report the blocker and verified partial progress; do not claim completion."
+                    ),
+                    tool_name=tool_name,
+                    count=self._total_failure_count,
+                    signature=signature,
+                )
+                self._total_failure_halt = decision
+                self._halt_decision = decision
+                return decision
             exact_count = self._exact_failure_counts.get(signature, 0) + 1
             self._exact_failure_counts[signature] = exact_count
             self._no_progress.pop(signature, None)
@@ -751,14 +787,18 @@ def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
     """Action-oriented guidance for recovering from repeated tool failures."""
     common = (
         f"{tool_name} has failed {count} times this turn. This looks like a loop. "
-        "Do not switch to text-only replies; keep using tools, but diagnose before retrying. "
-        "First inspect the latest error/output and verify your assumptions. "
+        "Inspect the latest error/output. Make at most one focused diagnostic, then "
+        "retry only with a concrete correction supported by that evidence. "
+        "If no safe correction is available or the same blocker persists, stop and "
+        "report the blocker and verified partial progress. Do not claim success "
+        "or invent an attachment link. "
     )
     if tool_name == "terminal":
         return common + (
-            "For terminal failures, run a small diagnostic such as `pwd && ls -la` "
-            "in the same tool, then try an absolute path, a simpler command, a different "
-            "working directory, or a different tool such as read_file/write_file/patch."
+            "For terminal failures, use the error to choose a diagnostic relevant to "
+            "the failing command, not repeated generic directory listings. If a supported "
+            "artifact generator already succeeded and validated its output, use that "
+            "result rather than rebuilding it or writing repeated ad-hoc validators."
         )
     return common + (
         "Try different arguments, a narrower query/path, an absolute path when relevant, "

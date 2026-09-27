@@ -535,6 +535,9 @@ tool_loop_guardrails:
   hard_stop_after:
     exact_failure: 5
     same_tool_failure: 8
+    # Cumulative failures across tools, not reset by successful diagnostics.
+    # Requires hard_stop_enabled; set 0 to disable this additional budget.
+    total_failure: 12
     idempotent_no_progress: 5
 
 # =============================================================================

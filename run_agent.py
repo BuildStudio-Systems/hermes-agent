@@ -8748,6 +8748,14 @@ class AIAgent:
             self._tool_guardrail_halt_decision = decision
 
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
+        if decision.code == "total_tool_failure_halt":
+            return (
+                f"I stopped after {decision.count} failed tool attempts in this turn "
+                "to avoid a retry loop. The requested work is not confirmed complete. "
+                "Successful diagnostic commands do not confirm that the task succeeded. "
+                "The last tool result records the blocker; it needs a corrected approach "
+                "before another attempt."
+            )
         tool = decision.tool_name or "a tool"
         return (
             f"I stopped retrying {tool} because it hit the tool-call guardrail "

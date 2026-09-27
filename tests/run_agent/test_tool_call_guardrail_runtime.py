@@ -1,9 +1,12 @@
 """Runtime tests for tool-call loop guardrails."""
 
 import json
+import os
 import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from run_agent import AIAgent
 
@@ -153,7 +156,7 @@ def test_sequential_after_call_appends_guidance_to_tool_result_without_extra_mes
     assert "repeated_exact_failure_warning" in messages[0]["content"]
 
 
-def test_same_tool_failure_warning_tells_model_to_recover_with_tools():
+def test_same_tool_failure_warning_allows_bounded_recovery_and_honest_exit():
     agent = _make_agent("terminal")
     guardrails = getattr(agent, "_tool_guardrails")
     guardrails.after_call(
@@ -177,11 +180,79 @@ def test_same_tool_failure_warning_tells_model_to_recover_with_tools():
 
     content = messages[0]["content"]
     assert "same_tool_failure_warning" in content
-    assert "Do not switch to text-only replies" in content
-    assert "keep using tools" in content
-    assert "pwd && ls -la" in content
-    assert "absolute path" in content
-    assert "different tool" in content
+    assert "Do not switch to text-only replies" not in content
+    assert "one focused diagnostic" in content
+    assert "report the blocker" in content
+    assert "Do not claim success" in content
+    assert "already succeeded" in content
+
+
+def test_total_failure_budget_stops_pdf_repair_loop_and_streams_explanation():
+    agent = _make_agent("terminal", max_iterations=12, config=_hard_stop_config(
+        hard_stop_after={"total_failure": 3, "exact_failure": 5, "same_tool_failure": 8},
+    ))
+    responses = [
+        _mock_response(content="", finish_reason="tool_calls", tool_calls=[
+            _mock_tool_call("terminal", json.dumps({"command": command}), f"c{index}")
+        ])
+        for index, command in enumerate(("validate-1", "pwd", "validate-2", "pwd", "validate-3", "must-not-run"))
+    ]
+    agent.client.chat.completions.create.side_effect = responses
+    agent._disable_streaming = True
+    deltas = []
+    agent.stream_delta_callback = deltas.append
+    with (
+        patch("run_agent.handle_function_call", side_effect=[
+            json.dumps({"exit_code": code}) for code in (1, 0, 1, 0, 1)
+        ]) as dispatch,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("Create a synthetic PDF")
+    assert dispatch.call_count == 5
+    assert agent.client.chat.completions.create.call_count == 5
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert result["guardrail"]["code"] == "total_tool_failure_halt"
+    assert result["final_response"] in deltas
+    assert "failed tool attempts" in result["final_response"]
+    assert "not confirmed complete" in result["final_response"]
+    assert "MEDIA:" not in result["final_response"]
+
+
+def test_total_failure_budget_blocks_remaining_sequential_batch_with_paired_results():
+    agent = _make_agent("terminal", config=_hard_stop_config(
+        hard_stop_after={"total_failure": 1},
+    ))
+    msg = SimpleNamespace(content="", tool_calls=[
+        _mock_tool_call("terminal", json.dumps({"command": command}), call_id)
+        for command, call_id in (("fail", "first"), ("must-not-run", "second"))
+    ])
+    messages = []
+    with patch("run_agent.handle_function_call", return_value=json.dumps({"exit_code": 1})) as dispatch:
+        agent._execute_tool_calls_sequential(msg, messages, "synthetic-batch")
+    assert dispatch.call_count == 1
+    assert [m["tool_call_id"] for m in messages] == ["first", "second"]
+    assert all(m["role"] == "tool" for m in messages)
+    assert "total_tool_failure_halt" in messages[1]["content"]
+
+
+@pytest.mark.parametrize("executor", ["_execute_tool_calls_sequential", "_execute_tool_calls_concurrent"])
+def test_exhausted_total_budget_blocks_next_batch_in_both_dispatch_paths(executor):
+    agent = _make_agent("web_search", config=_hard_stop_config(
+        hard_stop_after={"total_failure": 1},
+    ))
+    agent._tool_guardrails.after_call("terminal", {}, "Error", failed=True)
+    msg = SimpleNamespace(content="", tool_calls=[
+        _mock_tool_call("web_search", json.dumps({"query": query}), query)
+        for query in ("a", "b")
+    ])
+    messages = []
+    with patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as dispatch:
+        getattr(agent, executor)(msg, messages, "synthetic-batch")
+    dispatch.assert_not_called()
+    assert [m["tool_call_id"] for m in messages] == ["a", "b"]
+    assert all("total_tool_failure_halt" in m["content"] for m in messages)
 
 
 def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_and_preserves_result_order():
@@ -293,7 +364,7 @@ def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispat
     assert observed["start"] == expected
     assert observed["dispatch"] == expected
     assert observed["checkpoint"] == [
-        ("/approved/path", "before write_file")
+        (os.path.normpath("/approved/path"), "before write_file")
     ]
 
 
