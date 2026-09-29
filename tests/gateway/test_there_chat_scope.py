@@ -324,3 +324,32 @@ def test_existing_lazy_persistence_records_business_origin(tmp_path):
         assert row["session_key"] == scope.session_id
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize('record', [False, True])
+async def test_device_delivery_does_not_leak_fabricated_stream_or_old_history(tmp_path, monkeypatch, stream, record):
+    from gateway.there_chat_scope import record_device_result, DEVICE_HEADER
+    class FakeAgent:
+        session_prompt_tokens = session_completion_tokens = session_total_tokens = 0
+        def __init__(self, **kwargs):
+            self.session_id=kwargs['session_id'];self.callback=kwargs.get('stream_delta_callback')
+        def run_conversation(self, **kwargs):
+            if self.callback:self.callback('UNVERIFIED_DEVICE_SUCCESS')
+            if record:record_device_result({'action':'inspect','device':'ai'}, {'state':'failed','exit_code':7,'output':'READ_ERROR'})
+            return {'final_response':'UNVERIFIED_DEVICE_SUCCESS','messages':[{'role':'assistant','content':'UNVERIFIED_DEVICE_SUCCESS'}]}
+    monkeypatch.setattr('run_agent.AIAgent',FakeAgent)
+    monkeypatch.setattr('gateway.run._resolve_runtime_agent_kwargs',lambda:{'provider':'openai','api_key':'synthetic','base_url':'https://example.test/v1'})
+    monkeypatch.setattr('gateway.run._resolve_gateway_model',lambda:'test-model')
+    monkeypatch.setattr('gateway.run._load_gateway_config',lambda:{})
+    monkeypatch.setattr('gateway.run.GatewayRunner._load_reasoning_config',staticmethod(lambda *_:{'enabled':False}))
+    monkeypatch.setattr('gateway.run.GatewayRunner._load_fallback_model',staticmethod(lambda:None))
+    monkeypatch.setattr('hermes_cli.tools_config._get_platform_tools',lambda *_:set())
+    async with server(tmp_path,monkeypatch) as (_adapter,_db,client):
+        request=body(stream=stream);request['messages'][-1]['content']='there_devices inspect ai'
+        response=await client.post('/v1/chat/completions',headers=headers(**{DEVICE_HEADER:'synthetic'}),json=request)
+        text=await response.text()
+        assert response.status==200,text
+        assert 'UNVERIFIED_DEVICE_SUCCESS' not in text
+        assert ('READ_ERROR' if record else 'No device-tool receipt') in text

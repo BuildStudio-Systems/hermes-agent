@@ -1,0 +1,78 @@
+"""Deterministic delivery for explicit THERE device-tool requests.
+
+Model prose is not execution evidence. This gate covers requests naming
+there_devices plus an action. Ordinary conversations keep streaming normally.
+Only the real plugin can record a response; prior messages are never consulted.
+"""
+import copy
+import json
+import re
+import threading
+
+
+def requires_device_evidence(message):
+    return isinstance(message, str) and bool(
+        re.search(r'\bthere_devices\b', message, re.I)
+        and re.search(r'\b(list|inspect|operate|propose|job)\b', message, re.I))
+
+
+class DeviceEvidence:
+    def __init__(self):
+        self._records = []
+        self._lock = threading.Lock()
+
+    def record(self, arguments, response):
+        # Store only a current plugin invocation, never a supplied transcript.
+        with self._lock:
+            self._records.append((copy.deepcopy(arguments), copy.deepcopy(response)))
+
+    def render(self, message):
+        if re.search(r'[\u3040-\u30ff]', message):
+            intro = '今回のデバイスツール実行記録です。以下にない要求の結果は未確認です。'
+            missing = '今回はデバイスツールの実行記録がありません。デバイスの現在の状態や操作の成功は確認できません。推測した結果は表示しません。再実行は行っていません。'
+        elif re.search(r'[\u3400-\u9fff]', message):
+            intro = '以下为本轮设备工具的实际回执；未列出的请求结果尚未确认。登记的操作数量不代表全部操作均已测试。'
+            missing = '本轮没有设备工具调用回执，无法确认设备当前状态或操作成功。已拦截未经验证的模型回答，未自动重试。'
+        else:
+            intro = 'Actual device-tool receipts for this turn follow. Any requested result not listed remains unverified. Registered recipe counts are not counts of tested operations.'
+            missing = 'No device-tool receipt was recorded this turn. Current device state or operation success cannot be verified. Unverified model prose was withheld; no automatic retry was performed.'
+        with self._lock:
+            records = copy.deepcopy(self._records)
+        if not records:
+            return missing
+        rendered = [intro]
+        for args, response in records:
+            request = {k: args[k] for k in ('action', 'device', 'operation', 'job') if k in args}
+            # The broker already restricts inventory and diagnostic output.
+            # Do not repeat full proposed scripts in a chat execution receipt.
+            data = {k: response[k] for k in (
+                'device_count', 'operation_count', 'devices', 'error', 'status',
+                'state', 'exit_code', 'output', 'truncated', 'snapshot',
+                'id', 'device', 'description', 'result', 'review_url') if k in response}
+            if data.get('state') == 'pending':
+                data['execution_confirmed'] = False
+                data['review_url'] = '/api/v1/device-control/console'
+            body = json.dumps({'request': request, 'response': data}, ensure_ascii=False, indent=2)
+            # A diagnostic string is not a request to publish a local artifact.
+            body = body.replace('MEDIA:', '\\u004dEDIA:')
+            if len(body) > 100000:
+                body = json.dumps({'request': request, 'receipt_too_large': True,
+                                   'result_unverified_in_chat': True})
+            longest = max((len(m.group()) for m in re.finditer(r'`+', body)), default=0)
+            fence = '`' * max(3, longest + 1)
+            rendered.append(fence + 'json\n' + body + '\n' + fence)
+        return '\n\n'.join(rendered)
+
+
+def verified_result(result, evidence, message):
+    """Replace only this turn's final delivery, keeping prior history intact."""
+    final = evidence.render(message)
+    updated = dict(result)
+    updated['final_response'] = final
+    messages = result.get('messages')
+    if isinstance(messages, list) and messages:
+        updated['messages'] = list(messages)
+        last = messages[-1]
+        if isinstance(last, dict) and last.get('role') == 'assistant' and not last.get('tool_calls'):
+            updated['messages'][-1] = {**last, 'content': final}
+    return updated

@@ -7730,6 +7730,8 @@ class APIServerAdapter(BasePlatformAdapter):
         request_profile = _api_request_profile.get()
         request_file_owner = _api_request_file_owner.get()
         request_there_chat = _api_request_there_chat.get()
+        from gateway.there_device_evidence import requires_device_evidence, verified_result
+        device_evidence_required = bool(request_there_chat and requires_device_evidence(user_message))
         request_browser_control_principal = (
             _api_request_browser_control_principal.get()
         )
@@ -7742,7 +7744,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
             with self._profile_scope(request_profile), device_capability_scope(
                 request_there_chat.device_capability if request_there_chat else ""
-            ):
+            ) as device_evidence:
                 tokens = self._bind_api_server_session(
                     file_owner=request_there_chat.owner_id if request_there_chat else request_file_owner,
                     chat_id=request_there_chat.chat_id if request_there_chat else (session_id or ""),
@@ -7758,7 +7760,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
-                        stream_delta_callback=stream_delta_callback,
+                        stream_delta_callback=(lambda _delta: None) if device_evidence_required and stream_delta_callback else stream_delta_callback,
                         tool_progress_callback=tool_progress_callback,
                         tool_start_callback=tool_start_callback,
                         tool_complete_callback=tool_complete_callback,
@@ -7794,6 +7796,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         conversation_history=conversation_history,
                         task_id=effective_task_id,
                     )
+                    if device_evidence_required:
+                        result = verified_result(result, device_evidence, user_message)
+                        if stream_delta_callback:
+                            stream_delta_callback(result['final_response'])
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,

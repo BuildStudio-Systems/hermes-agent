@@ -19,18 +19,29 @@ CHAT_HEADER = "X-BuildStudio-Chat-Id"
 OWNER_HEADER = "X-BuildStudio-User-Id"
 DEVICE_HEADER = "X-BuildStudio-Device-Capability"
 _device_capability = ContextVar("there_device_capability", default="")
+_device_evidence = ContextVar("there_device_evidence", default=None)
 
 
 def current_device_capability():
     return _device_capability.get()
 
 
+def record_device_result(arguments, response):
+    evidence = _device_evidence.get()
+    if evidence is not None:
+        evidence.record(arguments, response)
+
+
 @contextmanager
 def device_capability_scope(value):
+    from gateway.there_device_evidence import DeviceEvidence
+    evidence = DeviceEvidence()
     token = _device_capability.set(value)
+    evidence_token = _device_evidence.set(evidence)
     try:
-        yield
+        yield evidence
     finally:
+        _device_evidence.reset(evidence_token)
         _device_capability.reset(token)
 
 

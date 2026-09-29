@@ -10,16 +10,19 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def call(args, **kwargs):
-    from gateway.there_chat_scope import current_device_capability
+    from gateway.there_chat_scope import current_device_capability, record_device_result
+    def finish(value):
+        record_device_result(args if isinstance(args, dict) else {}, value)
+        return json.dumps(value, ensure_ascii=False)
     proof = current_device_capability()
     if not proof:
-        return json.dumps({'error': 'device_management_requires_registered_owner_chat'})
+        return finish({'error': 'device_management_requires_registered_owner_chat'})
     if not isinstance(args, dict) or args.get('action') not in {'list', 'inspect', 'operate', 'propose', 'job'}:
-        return json.dumps({'error': 'action_not_authorized'})
+        return finish({'error': 'action_not_authorized'})
     body = {k: args[k] for k in ('action', 'device', 'operation', 'script', 'description', 'job') if k in args}
     data = json.dumps(body).encode()
     if len(data) > 60000:
-        return json.dumps({'error': 'request_too_large'})
+        return finish({'error': 'request_too_large'})
     req = urllib.request.Request('http://127.0.0.1:8743/v1/control', data=data,
         headers={'Authorization': 'Bearer ' + proof, 'Content-Type': 'application/json'}, method='POST')
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
@@ -27,16 +30,18 @@ def call(args, **kwargs):
         with opener.open(req, timeout=115) as response:
             raw = response.read(500001)
             if len(raw) > 500000:
-                return json.dumps({'error': 'response_too_large'})
+                return finish({'error': 'response_too_large'})
             value = json.loads(raw)
+            if not isinstance(value, dict):
+                return finish({'error': 'device_broker_unavailable_or_invalid_response'})
     except urllib.error.HTTPError as e:
-        return json.dumps({'error': 'device_request_rejected', 'status': e.code})
+        return finish({'error': 'device_request_rejected', 'status': e.code})
     except (OSError, ValueError):
-        return json.dumps({'error': 'device_broker_unavailable_or_invalid_response'})
+        return finish({'error': 'device_broker_unavailable_or_invalid_response'})
     if body['action'] in {'propose', 'operate'} and value.get('state') == 'pending':
         value['review_url'] = '/api/v1/device-control/console'
         value['instruction'] = 'Pending only. Ask the owner to review and approve in the device console; never report this proposal as executed.'
-    return json.dumps(value, ensure_ascii=False)
+    return finish(value)
 
 
 def register(ctx):
