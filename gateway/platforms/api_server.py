@@ -62,7 +62,7 @@ from pathlib import Path
 from typing import Any, Dict, Hashable, List, Optional
 from urllib.parse import quote
 
-from gateway.there_chat_scope import CHAT_HEADER, ThereChatScope, parse_there_chat_scope
+from gateway.there_chat_scope import CHAT_HEADER, ThereChatScope, parse_there_chat_scope, device_capability_scope
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -7740,7 +7740,9 @@ class APIServerAdapter(BasePlatformAdapter):
         def _run():
             from gateway.session_context import clear_session_vars
 
-            with self._profile_scope(request_profile):
+            with self._profile_scope(request_profile), device_capability_scope(
+                request_there_chat.device_capability if request_there_chat else ""
+            ):
                 tokens = self._bind_api_server_session(
                     file_owner=request_there_chat.owner_id if request_there_chat else request_file_owner,
                     chat_id=request_there_chat.chat_id if request_there_chat else (session_id or ""),

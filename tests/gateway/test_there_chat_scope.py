@@ -260,7 +260,11 @@ async def test_auth_and_header_fail_closed(tmp_path, monkeypatch, key, request_h
 
 
 @pytest.mark.asyncio
-async def test_thread_bound_identity_and_constructor(tmp_path, monkeypatch):
+@pytest.mark.parametrize('proof', ['', 'synthetic-device-capability'])
+async def test_thread_bound_identity_and_constructor(tmp_path, monkeypatch, proof):
+    from gateway.there_chat_scope import current_device_capability, DEVICE_HEADER
+    from tools.thread_context import propagate_context_to_thread
+    from concurrent.futures import ThreadPoolExecutor
     captured = {}
 
     class FakeAgent:
@@ -269,6 +273,10 @@ async def test_thread_bound_identity_and_constructor(tmp_path, monkeypatch):
             captured.update(kwargs)
             self.session_id = kwargs["session_id"]
         def run_conversation(self, **kwargs):
+            captured['device_capability'] = current_device_capability()
+            with ThreadPoolExecutor(1) as executor:
+                captured['tool_capability'] = executor.submit(propagate_context_to_thread(current_device_capability)).result()
+                captured['reused_worker_capability'] = executor.submit(current_device_capability).result()
             captured["bound_user"] = get_bound_session_env("HERMES_SESSION_USER_ID")
             captured["bound_chat"] = get_bound_session_env("HERMES_SESSION_CHAT_ID")
             captured["request_history_authoritative"] = self._request_history_authoritative
@@ -282,8 +290,10 @@ async def test_thread_bound_identity_and_constructor(tmp_path, monkeypatch):
     monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
     monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
     async with server(tmp_path, monkeypatch) as (_adapter, _db, client):
-        response = await client.post("/v1/chat/completions", headers=headers(), json=body())
+        response = await client.post("/v1/chat/completions", headers=headers(**{DEVICE_HEADER: proof}), json=body())
         assert response.status == 200, await response.text()
+        assert captured['device_capability'] == captured['tool_capability'] == proof
+        assert captured['reused_worker_capability'] == current_device_capability() == ''
         assert captured["user_id"] == captured["bound_user"] == "admin-a"
         assert captured["chat_id"] == captured["bound_chat"] == CHAT_A
         assert captured["request_history_authoritative"] is True

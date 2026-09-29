@@ -5,7 +5,9 @@ PostgreSQL-backed request remains authoritative; never reload state.db history
 merely because a business chat was supplied.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from contextlib import contextmanager
+from contextvars import ContextVar
 import hashlib
 import json
 import uuid
@@ -15,12 +17,28 @@ from gateway.chat_file_artifacts import normalize_chat_file_owner
 
 CHAT_HEADER = "X-BuildStudio-Chat-Id"
 OWNER_HEADER = "X-BuildStudio-User-Id"
+DEVICE_HEADER = "X-BuildStudio-Device-Capability"
+_device_capability = ContextVar("there_device_capability", default="")
+
+
+def current_device_capability():
+    return _device_capability.get()
+
+
+@contextmanager
+def device_capability_scope(value):
+    token = _device_capability.set(value)
+    try:
+        yield
+    finally:
+        _device_capability.reset(token)
 
 
 @dataclass(frozen=True)
 class ThereChatScope:
     owner_id: str
     chat_id: str
+    device_capability: str = field(default="", repr=False, compare=False)
 
     @property
     def session_id(self) -> str:
@@ -57,4 +75,9 @@ def parse_there_chat_scope(headers, *, authenticated_key_configured: bool):
         raise ValueError("Invalid THERE chat ID") from None
     if any(name in headers for name in ("X-Hermes-Session-Id", "X-Hermes-Session-Key")):
         raise ValueError("THERE chat binding cannot override execution history or memory scope")
-    return ThereChatScope(owner_id=owner, chat_id=raw)
+    proof = headers.get(DEVICE_HEADER, "")
+    if not isinstance(proof, str) or len(proof) > 4096:
+        raise ValueError("Invalid device capability")
+    # This parser does not grant device access: the private broker verifies the
+    # Web signature, owner allowlist, scope and expiry on every operation.
+    return ThereChatScope(owner_id=owner, chat_id=raw, device_capability=proof)
