@@ -10,10 +10,18 @@ import re
 import threading
 
 
+# Python's \b treats CJK characters as word characters, so "用there_devices检查"
+# never matched \bthere_devices\b. Use ASCII-only boundaries and accept the
+# owner's Chinese/Japanese action verbs as well as the English action names.
+_TOOL_NAME = re.compile(r'(?<![A-Za-z0-9_])there_devices(?![A-Za-z0-9_])', re.I)
+_ACTION = re.compile(
+    r'(?<![A-Za-z0-9_])(?:list|inspect|operate|propose|job)(?![A-Za-z0-9_])'
+    r'|列出|检查|查看|诊断|执行|运行|重启|启动|停止|提案'
+    r'|一覧|確認|診断|実行|再起動|起動|停止|提案', re.I)
+
+
 def requires_device_evidence(message):
-    return isinstance(message, str) and bool(
-        re.search(r'\bthere_devices\b', message, re.I)
-        and re.search(r'\b(list|inspect|operate|propose|job)\b', message, re.I))
+    return isinstance(message, str) and bool(_TOOL_NAME.search(message) and _ACTION.search(message))
 
 
 class DeviceEvidence:
@@ -46,7 +54,7 @@ class DeviceEvidence:
             # The broker already restricts inventory and diagnostic output.
             # Do not repeat full proposed scripts in a chat execution receipt.
             data = {k: response[k] for k in (
-                'device_count', 'operation_count', 'devices', 'error', 'status',
+                'device_count', 'operation_count', 'devices', 'error', 'reason', 'status',
                 'state', 'exit_code', 'output', 'truncated', 'snapshot',
                 'id', 'device', 'description', 'result', 'review_url') if k in response}
             if data.get('state') == 'pending':
