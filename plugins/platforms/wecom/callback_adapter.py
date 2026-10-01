@@ -66,6 +66,15 @@ DEFAULT_PATH = "/wecom/callback"
 _MAX_BODY = 65_536
 ACCESS_TOKEN_TTL_SECONDS = 7200
 MESSAGE_DEDUP_TTL_SECONDS = 300
+CALLBACK_MAX_CLOCK_SKEW_SECONDS = 300
+
+
+def _fresh_callback_timestamp(value: str) -> bool:
+    # Check signed wall-clock time as well as MsgId retries; an old signed
+    # packet must not become executable again after the in-memory cache expires.
+    return (isinstance(value, str) and value.isascii() and value.isdecimal()
+            and 1 <= len(value) <= 12
+            and abs(time.time() - int(value)) <= CALLBACK_MAX_CLOCK_SKEW_SECONDS)
 
 
 def check_wecom_callback_requirements() -> bool:
@@ -121,7 +130,7 @@ class WecomCallbackAdapter(BasePlatformAdapter):
         self._http_client: Optional[httpx.AsyncClient] = None
         self._message_queue: asyncio.Queue[MessageEvent] = asyncio.Queue()
         self._poll_task: Optional[asyncio.Task] = None
-        self._seen_messages: Dict[str, float] = {}
+        self._seen_messages: Dict[tuple[str, str, str], float] = {}
         self._user_app_map: Dict[str, str] = {}
         self._access_tokens: Dict[str, Dict[str, Any]] = {}
 
@@ -312,6 +321,8 @@ class WecomCallbackAdapter(BasePlatformAdapter):
         timestamp = request.query.get("timestamp", "")
         nonce = request.query.get("nonce", "")
         echostr = request.query.get("echostr", "")
+        if not _fresh_callback_timestamp(timestamp):
+            return web.Response(status=403, text="invalid callback timestamp")
         for app in self._apps:
             try:
                 crypt = self._crypt_for_app(app)
@@ -332,6 +343,8 @@ class WecomCallbackAdapter(BasePlatformAdapter):
         if len(body_bytes) > _MAX_BODY:
             logger.warning("[WecomCallback] Payload too large (%d bytes) — rejected", len(body_bytes))
             return web.Response(status=413, text="payload too large")
+        if not _fresh_callback_timestamp(timestamp):
+            return web.Response(status=403, text="invalid callback timestamp")
         body = body_bytes.decode("utf-8", errors="replace")
 
         for app in self._apps:
@@ -345,12 +358,13 @@ class WecomCallbackAdapter(BasePlatformAdapter):
                     # producing duplicate inbound messages (#10305).
                     if event.message_id:
                         now = time.time()
-                        if event.message_id in self._seen_messages:
-                            if now - self._seen_messages[event.message_id] < MESSAGE_DEDUP_TTL_SECONDS:
+                        dedup_key = (str(app.get("corp_id", "")), str(app.get("agent_id", "")), event.message_id)
+                        if dedup_key in self._seen_messages:
+                            if now - self._seen_messages[dedup_key] < MESSAGE_DEDUP_TTL_SECONDS:
                                 logger.debug("[WecomCallback] Duplicate MsgId %s, skipping", event.message_id)
                                 return web.Response(text="success", content_type="text/plain")
-                            del self._seen_messages[event.message_id]
-                        self._seen_messages[event.message_id] = now
+                            del self._seen_messages[dedup_key]
+                        self._seen_messages[dedup_key] = now
                         # Prune expired entries when cache grows large
                         if len(self._seen_messages) > 2000:
                             cutoff = now - MESSAGE_DEDUP_TTL_SECONDS
@@ -408,7 +422,12 @@ class WecomCallbackAdapter(BasePlatformAdapter):
             return None
 
         user_id = root.findtext("FromUserName", default="")
-        corp_id = root.findtext("ToUserName", default=app.get("corp_id", ""))
+        corp_id = root.findtext("ToUserName", default="")
+        agent_id = root.findtext("AgentID", default="")
+        if not user_id or corp_id != str(app.get("corp_id", "")):
+            raise WeComCryptoError("callback recipient mismatch")
+        if agent_id and agent_id != str(app.get("agent_id", "")):
+            raise WeComCryptoError("callback application mismatch")
         scoped_chat_id = self._user_app_key(corp_id, user_id)
         content = root.findtext("Content", default="").strip()
         if not content and msg_type == "event":
