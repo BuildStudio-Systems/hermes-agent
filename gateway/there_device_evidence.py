@@ -6,8 +6,11 @@ Only the real plugin can record a response; prior messages are never consulted.
 """
 import copy
 import json
+import logging
 import re
 import threading
+
+logger = logging.getLogger(__name__)
 
 
 # Python's \b treats CJK characters as word characters, so "用there_devices检查"
@@ -28,13 +31,55 @@ class DeviceEvidence:
     def __init__(self):
         self._records = []
         self._lock = threading.Lock()
+        self._stream = None
+        self._stream_message = ''
+        self._stream_count = 0
+
+    def start_stream(self, message, callback):
+        """Attach the gateway's nonblocking delta sink for this turn only."""
+        with self._lock:
+            self._stream_message = message
+            self._stream = callback
+            self._emit_locked(final=False)
+
+    def finish_stream(self):
+        with self._lock:
+            self._emit_locked(final=True)
+            self._stream = None
+
+    def _emit_locked(self, *, final):
+        if self._stream is None:
+            return
+        records = self._records[self._stream_count:]
+        if not records and (not final or self._stream_count):
+            return
+        rendered = self._render_records(self._stream_message, records)
+        # Each receipt is a complete fenced block. Later receipts append to
+        # the same introduction; concatenated deltas equal the saved answer.
+        if self._stream_count:
+            rendered = '\n\n' + rendered.split('\n\n', 1)[1]
+        self._stream_count = len(self._records)
+        try:
+            self._stream(rendered)
+        except Exception:
+            # Transport failure must not turn an already-completed operation
+            # into a tool error that the model might retry. Preserve evidence.
+            self._stream = None
+            logger.warning('Device receipt stream unavailable; evidence retained')
 
     def record(self, arguments, response):
         # Store only a current plugin invocation, never a supplied transcript.
         with self._lock:
             self._records.append((copy.deepcopy(arguments), copy.deepcopy(response)))
+            self._emit_locked(final=False)
 
     def render(self, message):
+        with self._lock:
+            records = copy.deepcopy(self._records)
+        return self._render_records(message, records)
+
+    @staticmethod
+    def _render_records(message, records):
         if re.search(r'[\u3040-\u30ff]', message):
             intro = '今回のデバイスツール実行記録です。以下にない要求の結果は未確認です。'
             missing = '今回はデバイスツールの実行記録がありません。デバイスの現在の状態や操作の成功は確認できません。推測した結果は表示しません。再実行は行っていません。'
@@ -44,8 +89,6 @@ class DeviceEvidence:
         else:
             intro = 'Actual device-tool receipts for this turn follow. Any requested result not listed remains unverified. Registered recipe counts are not counts of tested operations.'
             missing = 'No device-tool receipt was recorded this turn. Current device state or operation success cannot be verified. Unverified model prose was withheld; no automatic retry was performed.'
-        with self._lock:
-            records = copy.deepcopy(self._records)
         if not records:
             return missing
         rendered = [intro]

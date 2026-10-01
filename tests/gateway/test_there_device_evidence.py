@@ -110,3 +110,61 @@ def test_device_content_cannot_close_receipt_fence():
         text=evidence.render('there_devices inspect ai')
     assert '````json' in text and text.endswith('````')
     assert 'MEDIA:' not in text and '\\u004dEDIA:' in text
+
+
+@pytest.mark.parametrize('message', ['there_devices inspect ai', '用there_devices检查ai', 'there_devicesでaiを確認'])
+def test_receipts_stream_before_model_finishes_without_duplicate_final(message):
+    chunks = []
+    with device_capability_scope('synthetic') as evidence:
+        evidence.start_stream(message, chunks.append)
+        assert chunks == []  # Do not claim no receipt while tools are still running.
+        record_device_result({'action':'inspect','device':'ai'}, {'state':'succeeded','output':'FIRST_RECEIPT'})
+        assert 'FIRST_RECEIPT' in ''.join(chunks)
+        first = ''.join(chunks)
+        record_device_result({'action':'propose','device':'ai'}, {'state':'pending','id':'second','script':'NOT_CHAT_DATA'})
+        assert ''.join(chunks).startswith(first)
+        evidence.finish_stream()
+        final = verified_result({'final_response':'UNVERIFIED'}, evidence, message)['final_response']
+        assert ''.join(chunks) == final
+        assert final.count('FIRST_RECEIPT') == 1
+        assert '"execution_confirmed": false' in final
+        assert 'NOT_CHAT_DATA' not in final and 'UNVERIFIED' not in final
+
+
+def test_no_receipt_streams_only_when_turn_finishes():
+    chunks = []
+    with device_capability_scope('') as evidence:
+        evidence.start_stream('there_devices inspect ai', chunks.append)
+        assert chunks == []
+        evidence.finish_stream()
+        evidence.finish_stream()
+        assert ''.join(chunks) == evidence.render('there_devices inspect ai')
+        assert len(chunks) == 1
+
+
+def test_concurrent_receipts_have_one_order_in_stream_and_final():
+    chunks = []
+    with device_capability_scope('synthetic') as evidence:
+        evidence.start_stream('there_devices inspect', chunks.append)
+        with ThreadPoolExecutor(4) as pool:
+            list(pool.map(lambda i: evidence.record({'action':'inspect','device':str(i)}, {'output':'marker-'+str(i)}), range(12)))
+        evidence.finish_stream()
+        assert ''.join(chunks) == evidence.render('there_devices inspect')
+        for i in range(12):
+            assert ''.join(chunks).count('"output": "marker-'+str(i)+'"') == 1
+
+
+def test_stream_failure_never_turns_completed_device_operation_into_retry():
+    attempts = []
+    def disconnected(delta):
+        attempts.append(delta)
+        raise RuntimeError('private transport details')
+    with device_capability_scope('synthetic') as evidence:
+        evidence.start_stream('there_devices operate ai', disconnected)
+        evidence.record({'action':'operate','device':'ai'}, {'state':'succeeded','output':'DONE'})
+        evidence.record({'action':'job','job':'second'}, {'state':'pending'})
+        evidence.finish_stream()
+        assert len(attempts) == 1
+        final = evidence.render('there_devices operate ai')
+        assert 'DONE' in final and 'pending' in final
+        assert 'private transport details' not in final

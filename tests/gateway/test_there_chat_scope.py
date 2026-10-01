@@ -353,3 +353,54 @@ async def test_device_delivery_does_not_leak_fabricated_stream_or_old_history(tm
         assert response.status==200,text
         assert 'UNVERIFIED_DEVICE_SUCCESS' not in text
         assert ('READ_ERROR' if record else 'No device-tool receipt') in text
+
+
+@pytest.mark.asyncio
+async def test_device_receipt_reaches_http_client_before_final_model_response(tmp_path, monkeypatch):
+    import threading
+    from gateway.there_chat_scope import record_device_result, DEVICE_HEADER
+    release_final = threading.Event()
+    final_finished = threading.Event()
+
+    class FakeAgent:
+        session_prompt_tokens = session_completion_tokens = session_total_tokens = 0
+        def __init__(self, **kwargs):
+            self.session_id = kwargs['session_id']
+            self.callback = kwargs.get('stream_delta_callback')
+        def run_conversation(self, **kwargs):
+            if self.callback:
+                self.callback('UNVERIFIED_MODEL_TEXT')
+            record_device_result({'action':'inspect','device':'ai'},
+                                 {'state':'succeeded','output':'EARLY_RECEIPT_MARKER'})
+            release_final.wait(8)
+            final_finished.set()
+            return {'final_response':'UNVERIFIED_MODEL_TEXT',
+                    'messages':[{'role':'assistant','content':'UNVERIFIED_MODEL_TEXT'}]}
+
+    monkeypatch.setattr('run_agent.AIAgent', FakeAgent)
+    monkeypatch.setattr('gateway.run._resolve_runtime_agent_kwargs', lambda: {'provider':'openai','api_key':'synthetic','base_url':'https://example.test/v1'})
+    monkeypatch.setattr('gateway.run._resolve_gateway_model', lambda: 'test-model')
+    monkeypatch.setattr('gateway.run._load_gateway_config', lambda: {})
+    monkeypatch.setattr('gateway.run.GatewayRunner._load_reasoning_config', staticmethod(lambda *_: {'enabled':False}))
+    monkeypatch.setattr('gateway.run.GatewayRunner._load_fallback_model', staticmethod(lambda: None))
+    monkeypatch.setattr('hermes_cli.tools_config._get_platform_tools', lambda *_: set())
+    async with server(tmp_path, monkeypatch) as (_adapter, _db, client):
+        request = body(stream=True)
+        request['messages'][-1]['content'] = 'there_devices inspect ai'
+        try:
+            response = await client.post('/v1/chat/completions', headers=headers(**{DEVICE_HEADER:'synthetic'}), json=request)
+            assert response.status == 200
+            received = b''
+            async def until_receipt():
+                nonlocal received
+                while b'EARLY_RECEIPT_MARKER' not in received:
+                    line = await response.content.readline()
+                    assert line, 'Stream ended before the receipt'
+                    received += line
+            await asyncio.wait_for(until_receipt(), timeout=3)
+            assert not final_finished.is_set(), 'Receipt waited for model final response'
+        finally:
+            release_final.set()
+        received += await response.read()
+        assert received.count(b'EARLY_RECEIPT_MARKER') == 1
+        assert b'UNVERIFIED_MODEL_TEXT' not in received

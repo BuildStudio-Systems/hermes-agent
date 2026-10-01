@@ -7745,6 +7745,8 @@ class APIServerAdapter(BasePlatformAdapter):
             with self._profile_scope(request_profile), device_capability_scope(
                 request_there_chat.device_capability if request_there_chat else ""
             ) as device_evidence:
+                if device_evidence_required and stream_delta_callback:
+                    device_evidence.start_stream(user_message, stream_delta_callback)
                 tokens = self._bind_api_server_session(
                     file_owner=request_there_chat.owner_id if request_there_chat else request_file_owner,
                     chat_id=request_there_chat.chat_id if request_there_chat else (session_id or ""),
@@ -7799,7 +7801,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     if device_evidence_required:
                         result = verified_result(result, device_evidence, user_message)
                         if stream_delta_callback:
-                            stream_delta_callback(result['final_response'])
+                            device_evidence.finish_stream()
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
