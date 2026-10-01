@@ -44,7 +44,18 @@ def _rejection(error):
 def call(args, **kwargs):
     from gateway.there_chat_scope import current_device_capability, record_device_result
     def finish(value):
-        record_device_result(args if isinstance(args, dict) else {}, value)
+        streamed = record_device_result(args if isinstance(args, dict) else {}, value)
+        if streamed:
+            # Only the authenticated gateway's verified-receipt path sets this.
+            # Keep actual broker evidence unchanged; this is model guidance,
+            # never an execution result or an early-stop signal.
+            value = {**value, '_there_delivery': (
+                'The gateway is displaying actual device receipts and will replace your final prose. '
+                'Complete ALL remaining requested tool work, including dependent steps, before finishing. '
+                'Respect pending/running/error instructions; never retry a write to obtain a receipt. '
+                'When no further requested tool work remains, end with only "Receipt recorded." '
+                'Do not restate, summarize, translate or explain the receipts in final prose.'
+            )}
         return json.dumps(value, ensure_ascii=False)
     proof = current_device_capability()
     if not proof:

@@ -60,3 +60,54 @@ def test_rejection_forwards_only_fixed_reason_codes():
     assert 'reason' not in _rejection(error(b'not json'))
     unknown = _rejection(error(b'{"error":"future_code"}'))
     assert unknown['reason'] == 'future_code' and 'instruction' not in unknown
+
+
+def test_delivery_guidance_only_after_live_gateway_receipt():
+    from gateway.there_chat_scope import record_device_result
+    assert record_device_result({}, {}) is False
+    assert '_there_delivery' not in json.loads(call({'action': 'list'}))
+    with device_capability_scope('synthetic') as evidence:
+        # Merely having a capability does not enable short final delivery.
+        assert '_there_delivery' not in json.loads(call({'action': 'approve'}))
+    with device_capability_scope('synthetic') as evidence:
+        deltas = []
+        evidence.start_stream('there_devices inspect ai', deltas.append)
+        result = json.loads(call({'action': 'approve'}))
+        assert result['error'] == 'action_not_authorized'
+        assert 'ALL remaining requested tool work' in result['_there_delivery']
+        assert '_there_delivery' not in ''.join(deltas)
+        assert '_there_delivery' not in evidence.render('there_devices inspect ai')
+        evidence.finish_stream()
+        assert '_there_delivery' not in json.loads(call({'action': 'approve'}))
+
+
+def test_delivery_guidance_keeps_pending_and_multiple_receipts(monkeypatch):
+    from unittest.mock import MagicMock
+    from plugins import there_devices
+    response = MagicMock()
+    response.__enter__.return_value = response
+    response.read.return_value = b'{"state":"pending","id":"synthetic-job"}'
+    opener = MagicMock()
+    opener.open.return_value = response
+    monkeypatch.setattr(there_devices.urllib.request, 'build_opener', lambda *a: opener)
+    with device_capability_scope('synthetic') as evidence:
+        deltas = []
+        evidence.start_stream('there_devices propose', deltas.append)
+        for device in ('ai', 'web'):
+            result = json.loads(call({'action': 'propose', 'device': device, 'script': 'printf test'}))
+            assert result['state'] == 'pending'
+            assert 'never report this proposal as executed' in result['instruction']
+            assert 'dependent steps' in result['_there_delivery']
+        assert opener.open.call_count == 2
+        assert len(deltas) == 2
+        assert ''.join(deltas) == evidence.render('there_devices propose')
+
+
+def test_failed_delivery_does_not_request_short_final_or_retry():
+    with device_capability_scope('synthetic') as evidence:
+        def broken(_):
+            raise RuntimeError('disconnected')
+        evidence.start_stream('there_devices list', broken)
+        result = json.loads(call({'action': 'approve'}))
+        assert result == {'error': 'action_not_authorized'}
+        assert 'action_not_authorized' in evidence.render('there_devices list')

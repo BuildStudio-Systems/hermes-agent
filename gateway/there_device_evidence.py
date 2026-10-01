@@ -72,6 +72,7 @@ class DeviceEvidence:
         with self._lock:
             self._records.append((copy.deepcopy(arguments), copy.deepcopy(response)))
             self._emit_locked(final=False)
+            return self._stream is not None
 
     def render(self, message):
         with self._lock:

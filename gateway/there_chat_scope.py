@@ -29,7 +29,8 @@ def current_device_capability():
 def record_device_result(arguments, response):
     evidence = _device_evidence.get()
     if evidence is not None:
-        evidence.record(arguments, response)
+        return evidence.record(arguments, response)
+    return False
 
 
 @contextmanager
