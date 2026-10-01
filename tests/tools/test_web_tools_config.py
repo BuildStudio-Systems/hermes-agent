@@ -371,13 +371,21 @@ class TestParallelClientConfig:
 
         fake_parallel.Parallel = Parallel
         fake_parallel.AsyncParallel = AsyncParallel
-        sys.modules["parallel"] = fake_parallel
+        self._parallel_module_patch = patch.dict(sys.modules, {"parallel": fake_parallel})
+        self._parallel_module_patch.start()
+        # These are constructor/cache unit tests using an in-memory SDK.
+        # Do not invoke package installation or require its distribution metadata.
+        self._parallel_dependency_patch = patch(
+            "plugins.web.parallel.provider._ensure_parallel_sdk_installed"
+        )
+        self._parallel_dependency_patch.start()
 
     def teardown_method(self):
         import tools.web_tools
         tools.web_tools._parallel_client = None
         os.environ.pop("PARALLEL_API_KEY", None)
-        sys.modules.pop("parallel", None)
+        self._parallel_dependency_patch.stop()
+        self._parallel_module_patch.stop()
 
     def test_creates_client_with_key(self):
         """PARALLEL_API_KEY set → creates Parallel client."""
@@ -387,6 +395,7 @@ class TestParallelClientConfig:
             client = _get_parallel_client()
             assert client is not None
             assert isinstance(client, Parallel)
+            assert client.api_key == "test-key"
 
     def test_no_key_raises_with_helpful_message(self):
         """No PARALLEL_API_KEY → ValueError with guidance."""
