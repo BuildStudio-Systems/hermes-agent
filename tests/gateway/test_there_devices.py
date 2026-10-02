@@ -78,6 +78,9 @@ def test_rejection_forwards_only_fixed_reason_codes():
     assert 'reason' not in _rejection(error(b'not json'))
     unknown = _rejection(error(b'{"error":"future_code"}'))
     assert unknown['reason'] == 'future_code' and 'instruction' not in unknown
+    budget = _rejection(error(b'{"error":"monitor_task_already_executed_check_receipt"}'))
+    assert 'Do not start another' in budget['instruction'] and 'action job' in budget['instruction']
+    assert 'other devices' in _rejection(error(b'{"error":"monitor_target_mismatch"}'))['instruction']
 
 
 def test_delivery_guidance_only_after_live_gateway_receipt():

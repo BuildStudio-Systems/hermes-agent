@@ -16,6 +16,10 @@ _REASON_HINTS = {
     'operation_not_registered': 'Use an exact operation id returned by list.',
     'script_too_large_after_encoding': 'Shorten the script; nothing was created.',
     'proposals_disabled': 'This device only accepts its registered operations; free-form scripts are disabled. Use list and operate.',
+    # Automatic Monitor reviews: one node, one started operation per review.
+    'monitor_task_already_executed_check_receipt': 'This review already started its single operation. Do not start another; read the earlier receipt with action job if you have its id, otherwise report the earlier result as the outcome.',
+    'monitor_target_mismatch': 'This review is limited to the alerted node. Do not touch other devices or jobs; finish with what you have.',
+    'monitor_target_required': 'This review capability has no target node. Nothing can be run; report that the review could not start.',
 }
 
 
