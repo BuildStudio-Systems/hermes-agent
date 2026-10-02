@@ -27,6 +27,24 @@ def test_unscoped_and_approval_calls_never_connect():
     assert current_device_capability() == ''
 
 
+def test_database_metadata_arguments_reach_broker_with_scoped_identity(monkeypatch):
+    from plugins import there_devices
+    from unittest.mock import MagicMock
+    response=MagicMock();response.__enter__.return_value=response
+    response.read.return_value=b'{"state":"succeeded","output":"metadata only"}'
+    opener=MagicMock();opener.open.return_value=response
+    monkeypatch.setattr(there_devices.urllib.request,'build_opener',lambda *args:opener)
+    args={'action':'database','mode':'schema','database':'example','offset':100}
+    assert json.loads(call(args))['error']=='device_management_requires_registered_owner_chat'
+    opener.open.assert_not_called()
+    with device_capability_scope('test-proof'):
+        result=json.loads(call(args))
+    request=opener.open.call_args.args[0]
+    assert json.loads(request.data)==args
+    assert request.get_header('Authorization')=='Bearer test-proof'
+    assert result['state']=='succeeded'
+
+
 def test_capability_not_in_repr_or_session_identity():
     a = ThereChatScope('owner','chat','private-capability')
     b = ThereChatScope('owner','chat','different-capability')
