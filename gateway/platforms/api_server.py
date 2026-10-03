@@ -7730,6 +7730,12 @@ class APIServerAdapter(BasePlatformAdapter):
         request_profile = _api_request_profile.get()
         request_file_owner = _api_request_file_owner.get()
         request_there_chat = _api_request_there_chat.get()
+        from gateway.there_business_context import business_context_scope
+        business_proof = request_there_chat.business_context if request_there_chat else ''
+        # Hold provisional model prose while this turn has business authority.
+        # Ordinary conversation still uses its normal final answer; the receipt
+        # guard never turns a greeting into an expense-registration claim.
+        business_evidence_required = bool(business_proof)
         from gateway.there_device_evidence import requires_device_evidence, verified_result
         device_evidence_required = bool(request_there_chat and requires_device_evidence(user_message))
         request_browser_control_principal = (
@@ -7744,7 +7750,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
             with self._profile_scope(request_profile), device_capability_scope(
                 request_there_chat.device_capability if request_there_chat else ""
-            ) as device_evidence:
+            ) as device_evidence, business_context_scope(business_proof) as business_evidence:
                 if device_evidence_required and stream_delta_callback:
                     device_evidence.start_stream(user_message, stream_delta_callback)
                 tokens = self._bind_api_server_session(
@@ -7762,7 +7768,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
-                        stream_delta_callback=(lambda _delta: None) if device_evidence_required and stream_delta_callback else stream_delta_callback,
+                        stream_delta_callback=(lambda _delta: None) if (device_evidence_required or business_evidence_required) and stream_delta_callback else stream_delta_callback,
                         tool_progress_callback=tool_progress_callback,
                         tool_start_callback=tool_start_callback,
                         tool_complete_callback=tool_complete_callback,
@@ -7802,6 +7808,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         result = verified_result(result, device_evidence, user_message)
                         if stream_delta_callback:
                             device_evidence.finish_stream()
+                    if business_proof or business_evidence.has_records():
+                        result = business_evidence.apply(result,user_message)
+                        if business_evidence_required and stream_delta_callback:
+                            try: stream_delta_callback(result['final_response'])
+                            except Exception:
+                                logger.debug('Business receipt stream unavailable')
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,

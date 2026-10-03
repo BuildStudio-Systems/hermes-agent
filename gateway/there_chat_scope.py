@@ -11,6 +11,7 @@ from contextvars import ContextVar
 import hashlib
 import json
 import uuid
+import re
 
 from gateway.chat_file_artifacts import normalize_chat_file_owner
 
@@ -18,6 +19,7 @@ from gateway.chat_file_artifacts import normalize_chat_file_owner
 CHAT_HEADER = "X-BuildStudio-Chat-Id"
 OWNER_HEADER = "X-BuildStudio-User-Id"
 DEVICE_HEADER = "X-BuildStudio-Device-Capability"
+BUSINESS_HEADER = "X-BuildStudio-Business-Context"
 _device_capability = ContextVar("there_device_capability", default="")
 _device_evidence = ContextVar("there_device_evidence", default=None)
 
@@ -51,6 +53,7 @@ class ThereChatScope:
     owner_id: str
     chat_id: str
     device_capability: str = field(default="", repr=False, compare=False)
+    business_context: str = field(default="", repr=False, compare=False)
 
     @property
     def session_id(self) -> str:
@@ -74,6 +77,7 @@ def parse_there_chat_scope(headers, *, authenticated_key_configured: bool):
     """
     raw = headers.get(CHAT_HEADER)
     if raw is None:
+        if headers.get(BUSINESS_HEADER): raise ValueError('Business context requires a saved owner chat')
         return None
     if not authenticated_key_configured:
         raise ValueError("THERE chat binding requires API key authentication")
@@ -92,4 +96,7 @@ def parse_there_chat_scope(headers, *, authenticated_key_configured: bool):
         raise ValueError("Invalid device capability")
     # This parser does not grant device access: the private broker verifies the
     # Web signature, owner allowlist, scope and expiry on every operation.
-    return ThereChatScope(owner_id=owner, chat_id=raw, device_capability=proof)
+    business = headers.get(BUSINESS_HEADER, '')
+    if not isinstance(business,str) or (business and not re.fullmatch(r'[A-Za-z0-9_-]{43}',business)):
+        raise ValueError('Invalid business context')
+    return ThereChatScope(owner_id=owner, chat_id=raw, device_capability=proof,business_context=business)
