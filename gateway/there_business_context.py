@@ -81,7 +81,15 @@ class BusinessEvidence:
         needed=[field for row in records if row.get('status')=='needs_input' for field in row.get('fields',[])]
         if needed:
             labels=field_labels(needed,records,language)
-            if 'manual_custom_fields' in needed:
+            if {'company_binding', 'active_company_binding'} & set(needed):
+                setup_url='https://buildstudio-demo.com/#there-expenses'
+                setup={
+                    'en': 'Finance expense setup is incomplete or the selected company is unavailable. Nothing was registered. Open [Finance expense setup]({url}), select an active company, currency and timezone, and enable expense registration. Then resend one complete expense message. The company cannot be selected in chat.',
+                    'ja': 'Finance の経費設定が未完了、または選択した会社が利用できません。今回は登録していません。[Finance の経費設定]({url})で有効な会社・通貨・タイムゾーンを選び、経費登録を有効にしてください。その後、経費の全文をもう一度送ってください。チャット内では会社を選択できません。',
+                    'zh': 'Finance 费用设置尚未完成，或所选公司已不可用。本轮未登记。请打开 [Finance 费用设置]({url})，选择有效公司、币种和时区，并启用费用登记，再发送一条完整的开销消息。不能通过聊天代选公司。',
+                }[language]
+                rendered=(rendered+'\n\n' if lines else '')+setup.format(url=setup_url)
+            elif 'manual_custom_fields' in needed:
                 manual={'en':'A required Finance checkbox needs manual entry in Finance. Nothing was registered automatically; resending this message cannot fill that field.',
                     'ja':'Finance のチェックボックス項目は Finance で手動入力が必要です。自動登録は行っていません。このメッセージの再送では入力できません。',
                     'zh':'Finance 的复选框字段需要在 Finance 手工填写。本轮未自动登记，重新发送消息也无法代填该字段。'}[language]
