@@ -451,6 +451,33 @@ def _request_service_tier(model_options: Any) -> Any:
     return _REQUEST_OPTION_MISSING
 
 
+def _request_generation_options(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate supported Chat Completions controls, without provider escape hatches.
+
+    Output limits apply to each model step, not the sum of the tool loop.
+    The resolved server/model output ceiling is also enforced by _create_agent.
+    Null retains the provider default.
+    """
+    options = {}
+    value = body.get("temperature")
+    if value is not None:
+        if type(value) not in (int, float) or not 0 <= value <= 2:
+            raise ValueError("temperature must be a finite number between 0 and 2")
+        options["temperature"] = value
+    limits = []
+    for key in ("max_tokens", "max_completion_tokens"):
+        value = body.get(key)
+        if value is not None:
+            if type(value) is not int or not 1 <= value <= 131072:
+                raise ValueError(f"{key} must be an integer between 1 and 131072")
+            limits.append(value)
+    if len(set(limits)) > 1:
+        raise ValueError("max_tokens and max_completion_tokens must agree when both are supplied")
+    if limits:
+        options["max_tokens"] = limits[0]
+    return options
+
+
 def _request_thinking_overrides(model_options: Any) -> Optional[Dict[str, Any]]:
     """Allow only typed, request-scoped thinking controls for local templates.
 
@@ -3142,6 +3169,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_model: Optional[str] = None,
         requested_provider: Optional[str] = None,
         model_options: Optional[Dict[str, Any]] = None,
+        generation_options: Optional[Dict[str, Any]] = None,
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
@@ -3475,6 +3503,20 @@ class APIServerAdapter(BasePlatformAdapter):
         thinking_overrides = _request_thinking_overrides(model_options)
         if thinking_overrides is not None:
             agent_kwargs["request_overrides"] = thinking_overrides
+
+        if generation_options:
+            validated = _request_generation_options(generation_options)
+            if "max_tokens" in validated:
+                ceiling = agent_kwargs.get("max_tokens")
+                requested = validated["max_tokens"]
+                agent_kwargs["max_tokens"] = (
+                    min(ceiling, requested)
+                    if type(ceiling) is int and ceiling > 0 else requested
+                )
+            if "temperature" in validated:
+                overrides = dict(agent_kwargs.get("request_overrides") or {})
+                overrides["temperature"] = validated["temperature"]
+                agent_kwargs["request_overrides"] = overrides
 
         agent = AIAgent(**agent_kwargs)
         if there_chat_scope is not None:
@@ -5422,6 +5464,13 @@ class APIServerAdapter(BasePlatformAdapter):
         except (json.JSONDecodeError, Exception):
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
 
+        if not isinstance(body, dict):
+            return web.json_response(_openai_error("Request body must be a JSON object"), status=400)
+        try:
+            generation_options = _request_generation_options(body)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
             return web.json_response(
@@ -5574,6 +5623,8 @@ class APIServerAdapter(BasePlatformAdapter):
             virtual_model=self._model_name,
             allow_bare_model=self._direct_model_requests,
         )
+        if generation_options:
+            agent_overrides["generation_options"] = generation_options
         selection_error = self._request_route_conflict_error(
             session_id=session_id,
             gateway_session_key=gateway_session_key,
@@ -5709,6 +5760,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "provider",
                     "model_options",
                     "messages",
+                    "temperature",
+                    "max_tokens",
+                    "max_completion_tokens",
                     "tools",
                     "tool_choice",
                     "stream",
@@ -7688,6 +7742,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_model: Optional[str] = None,
         requested_provider: Optional[str] = None,
         model_options: Optional[Dict[str, Any]] = None,
+        generation_options: Optional[Dict[str, Any]] = None,
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         requested_runtime: Optional[Dict[str, Any]] = None,
@@ -7776,6 +7831,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         requested_model=requested_model,
                         requested_provider=requested_provider,
                         model_options=model_options,
+                        **({"generation_options": generation_options} if generation_options else {}),
                         route=route,
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
