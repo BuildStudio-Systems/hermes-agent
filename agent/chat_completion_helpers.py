@@ -4329,13 +4329,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     if pending_text_parts or _provider_stream_text_may_be_sse(delta_content):
                         pending_text_parts.append(delta_content)
                         pending_text = "".join(pending_text_parts)
-                        if _provider_stream_text_may_be_sse(pending_text):
-                            continue
-                        _flush_pending_stream_text()
-                        continue
-                    _fire_first_delta()
-                    agent._fire_stream_delta(delta_content)
-                    deltas_were_sent["yes"] = True
+                        if not _provider_stream_text_may_be_sse(pending_text):
+                            _flush_pending_stream_text()
+                        # Only defer text delivery. The same chunk may carry
+                        # tool deltas, usage and the terminal finish_reason;
+                        # skipping it fabricates a dropped stream and retries
+                        # an answer the provider already completed.
+                    else:
+                        _fire_first_delta()
+                        agent._fire_stream_delta(delta_content)
+                        deltas_were_sent["yes"] = True
                 # Tool calls suppress regular content streaming (avoids
                 # displaying chatty "I'll use the tool..." text alongside
                 # tool calls).  But reasoning tags embedded in suppressed
