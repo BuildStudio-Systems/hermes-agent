@@ -1199,6 +1199,38 @@ class TestChatCompletionsEndpoint:
                 # Final content must also be present
                 assert "Here are the files." in body
 
+    @pytest.mark.asyncio
+    async def test_stream_keeps_monitor_outcome_out_of_model_content(self, adapter):
+        """Trusted Monitor disposition uses its own bounded SSE event."""
+        import asyncio
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb(("__monitor_outcome__", {
+                        "schema": "buildstudio.monitor-outcome.v1",
+                        "outcome": "manual_required",
+                    }))
+                    await asyncio.sleep(0.01)
+                    cb("private receipt")
+                return (
+                    {"final_response": "private receipt", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={"model": "test", "messages": [{"role": "user", "content": "review"}], "stream": True},
+                )
+                assert resp.status == 200
+                body = await resp.text()
+        assert "event: buildstudio.monitor.outcome" in body
+        assert '"outcome": "manual_required"' in body
+        assert '"content": "manual_required"' not in body
+
 
     @pytest.mark.asyncio
     async def test_stream_emits_tool_lifecycle_with_call_id(self, adapter):

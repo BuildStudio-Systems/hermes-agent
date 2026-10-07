@@ -168,3 +168,61 @@ def test_stream_failure_never_turns_completed_device_operation_into_retry():
         final = evidence.render('there_devices operate ai')
         assert 'DONE' in final and 'pending' in final
         assert 'private transport details' not in final
+
+
+def _recovery_job(outcome, *, changed, verified=None, schema=True, state='succeeded'):
+    helper={'outcome':outcome,'changed':changed}
+    if schema:
+        helper['schema']='buildstudio.monitor-recovery.v1'
+    if verified is not None:
+        helper['verified']=verified
+    return {'id':'a'*32,'state':state,'result':{
+        'state':'succeeded','exit_code':0,'output':json.dumps(helper)+'\n','truncated':False}}
+
+
+@pytest.mark.parametrize(('response','expected'), [
+    (_recovery_job('already_healthy',changed=False), 'already_healthy'),
+    (_recovery_job('recovered',changed=True,verified=True), 'recovered'),
+    (_recovery_job('manual_required',changed=False), 'manual_required'),
+    # Compatibility with the currently deployed v0 helper during rollout.
+    (_recovery_job('review_required',changed=False,schema=False), 'manual_required'),
+    (_recovery_job('unconfirmed',changed=True,verified=False), 'unconfirmed'),
+])
+def test_monitor_recovery_outcome_comes_only_from_fixed_tool_receipt(response, expected):
+    message='Monitor自动核查。先调用 there_devices，action=operate，device=monitoring，operation=monitor-dns-recovery。'
+    with device_capability_scope('synthetic') as evidence:
+        record_device_result({'action':'operate','device':'monitoring','operation':'monitor-dns-recovery'},response)
+        assert evidence.monitor_recovery_outcome(message)==expected
+
+
+def test_monitor_recovery_running_receipt_uses_matching_job_and_fails_closed():
+    message='Monitor自动核查。调用 there_devices operate monitor-dns-recovery。'
+    with device_capability_scope('synthetic') as evidence:
+        record_device_result({'action':'operate','device':'monitoring','operation':'monitor-dns-recovery'},
+                             {'id':'a'*32,'state':'running'})
+        assert evidence.monitor_recovery_outcome(message)=='unconfirmed'
+        record_device_result({'action':'job','job':'a'*32},
+                             _recovery_job('recovered',changed=True,verified=True))
+        assert evidence.monitor_recovery_outcome(message)=='recovered'
+
+    with device_capability_scope('synthetic') as evidence:
+        # Model prose cannot manufacture an outcome when the plugin has no
+        # matching receipt.
+        assert evidence.monitor_recovery_outcome(message)=='unconfirmed'
+        record_device_result({'action':'inspect','device':'monitoring'},
+                             {'state':'succeeded','output':'recovered'})
+        assert evidence.monitor_recovery_outcome(message)=='unconfirmed'
+
+
+@pytest.mark.parametrize('response', [
+    _recovery_job('recovered',changed=True,verified=False),
+    _recovery_job('recovered',changed=False,verified=True),
+    _recovery_job('already_healthy',changed=True),
+    {'id':'a'*32,'state':'succeeded','result':{'state':'succeeded','exit_code':0,
+        'output':'not json','truncated':False}},
+])
+def test_monitor_recovery_invalid_success_shapes_are_unconfirmed(response):
+    message='Monitor自动核查。调用 there_devices operate monitor-dns-recovery。'
+    with device_capability_scope('synthetic') as evidence:
+        record_device_result({'action':'operate','device':'monitoring','operation':'monitor-dns-recovery'},response)
+        assert evidence.monitor_recovery_outcome(message)=='unconfirmed'

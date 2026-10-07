@@ -22,6 +22,16 @@ _ACTION = re.compile(
     r'|列出|检查|查看|诊断|执行|运行|重启|启动|停止|提案'
     r'|一覧|確認|診断|実行|再起動|起動|停止|提案', re.I)
 
+_MONITOR_RECOVERY_OPERATION = 'monitor-dns-recovery'
+_MONITOR_RECOVERY_SCHEMA = 'buildstudio.monitor-recovery.v1'
+_MONITOR_MANUAL_OUTCOMES = frozenset({
+    # ``review_required`` and the more specific values are emitted by the
+    # original reviewed helper. New helpers normalize them to
+    # ``manual_required`` while retaining the fixed reason separately.
+    'manual_required', 'review_required', 'cooldown', 'state_changed',
+    'busy', 'inspection_failed',
+})
+
 
 def requires_device_evidence(message):
     return isinstance(message, str) and bool(_TOOL_NAME.search(message) and _ACTION.search(message))
@@ -78,6 +88,86 @@ class DeviceEvidence:
         with self._lock:
             records = copy.deepcopy(self._records)
         return self._render_records(message, records)
+
+    def monitor_recovery_outcome(self, message):
+        """Return the bounded outcome of the fixed Monitor recovery recipe.
+
+        The value comes only from responses recorded by the real
+        ``there_devices`` plugin in this turn. Model prose and prior history do
+        not participate. An invalid or incomplete receipt is deliberately
+        ``unconfirmed`` so callers cannot mark an alert resolved or replay an
+        operation whose effect is unknown.
+        """
+        if (not isinstance(message, str)
+                or _MONITOR_RECOVERY_OPERATION not in message
+                or not requires_device_evidence(message)):
+            return None
+        with self._lock:
+            records = copy.deepcopy(self._records)
+        operations = [
+            (args, response) for args, response in records
+            if (isinstance(args, dict)
+                and args.get('action') == 'operate'
+                and args.get('operation') == _MONITOR_RECOVERY_OPERATION)
+        ]
+        if not operations:
+            return 'unconfirmed'
+
+        # Repeated calls are only acceptable when they reference the same
+        # idempotent broker job. A second distinct job can never prove recovery.
+        job_ids = {
+            response.get('id') for _, response in operations
+            if isinstance(response, dict) and isinstance(response.get('id'), str)
+        }
+        if len(job_ids) > 1:
+            return 'unconfirmed'
+        response = operations[-1][1]
+        job_id = next(iter(job_ids), None)
+        if job_id:
+            followups = [
+                item for args, item in records
+                if (isinstance(args, dict) and args.get('action') == 'job'
+                    and args.get('job') == job_id)
+            ]
+            if followups:
+                response = followups[-1]
+        return self._normalize_monitor_recovery_response(response)
+
+    @staticmethod
+    def _normalize_monitor_recovery_response(response):
+        if not isinstance(response, dict):
+            return 'unconfirmed'
+        state = response.get('state')
+        if state == 'pending':
+            return 'manual_required'
+        if state != 'succeeded':
+            return 'unconfirmed'
+        result = response.get('result')
+        if (not isinstance(result, dict) or result.get('state') != 'succeeded'
+                or result.get('exit_code') != 0 or result.get('truncated') is not False
+                or not isinstance(result.get('output'), str)):
+            return 'unconfirmed'
+        try:
+            helper = json.loads(result['output'].strip())
+        except (ValueError, TypeError, UnicodeError):
+            return 'unconfirmed'
+        if (not isinstance(helper, dict)
+                or helper.get('schema', _MONITOR_RECOVERY_SCHEMA) != _MONITOR_RECOVERY_SCHEMA
+                or type(helper.get('changed')) is not bool):
+            return 'unconfirmed'
+        outcome = helper.get('outcome')
+        if outcome == 'already_healthy' and helper['changed'] is False:
+            return outcome
+        if (outcome == 'recovered' and helper['changed'] is True
+                and helper.get('verified') is True):
+            return outcome
+        if (outcome in _MONITOR_MANUAL_OUTCOMES
+                and helper.get('verified') is not True):
+            return 'manual_required'
+        if (outcome == 'unconfirmed' and helper['changed'] is True
+                and helper.get('verified') is False):
+            return outcome
+        return 'unconfirmed'
 
     @staticmethod
     def _render_records(message, records):

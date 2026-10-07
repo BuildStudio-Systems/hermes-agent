@@ -5939,6 +5939,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 """
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     await response.write(_sse_frame(item[1], event="hermes.tool.progress"))
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__monitor_outcome__":
+                    await response.write(_sse_frame(item[1], event="buildstudio.monitor.outcome"))
                 else:
                     for content in media_stream.feed(str(item)):
                         await _emit_content(content)
@@ -7864,6 +7866,15 @@ class APIServerAdapter(BasePlatformAdapter):
                         result = verified_result(result, device_evidence, user_message)
                         if stream_delta_callback:
                             device_evidence.finish_stream()
+                            monitor_outcome = device_evidence.monitor_recovery_outcome(user_message)
+                            if monitor_outcome is not None:
+                                # Private control event derived from actual
+                                # plugin receipts. It contains no device output
+                                # and cannot be supplied by model prose.
+                                stream_delta_callback(("__monitor_outcome__", {
+                                    "schema": "buildstudio.monitor-outcome.v1",
+                                    "outcome": monitor_outcome,
+                                }))
                     if business_proof or business_evidence.has_records():
                         result = business_evidence.apply(result,user_message)
                         if business_evidence_required and stream_delta_callback:

@@ -356,6 +356,42 @@ async def test_device_delivery_does_not_leak_fabricated_stream_or_old_history(tm
 
 
 @pytest.mark.asyncio
+async def test_monitor_recovery_receipt_emits_private_structured_outcome(tmp_path, monkeypatch):
+    from gateway.there_chat_scope import record_device_result, DEVICE_HEADER
+
+    class FakeAgent:
+        session_prompt_tokens = session_completion_tokens = session_total_tokens = 0
+        def __init__(self, **kwargs):
+            self.session_id=kwargs['session_id']
+        def run_conversation(self, **kwargs):
+            helper={'schema':'buildstudio.monitor-recovery.v1','outcome':'recovered',
+                    'changed':True,'verified':True}
+            record_device_result(
+                {'action':'operate','device':'monitoring','operation':'monitor-dns-recovery'},
+                {'id':'a'*32,'state':'succeeded','result':{'state':'succeeded','exit_code':0,
+                    'output':json.dumps(helper)+'\n','truncated':False}},
+            )
+            return {'final_response':'MODEL CLAIM','messages':[{'role':'assistant','content':'MODEL CLAIM'}]}
+
+    monkeypatch.setattr('run_agent.AIAgent',FakeAgent)
+    monkeypatch.setattr('gateway.run._resolve_runtime_agent_kwargs',lambda:{'provider':'openai','api_key':'synthetic','base_url':'https://example.test/v1'})
+    monkeypatch.setattr('gateway.run._resolve_gateway_model',lambda:'test-model')
+    monkeypatch.setattr('gateway.run._load_gateway_config',lambda:{})
+    monkeypatch.setattr('gateway.run.GatewayRunner._load_reasoning_config',staticmethod(lambda *_:{'enabled':False}))
+    monkeypatch.setattr('gateway.run.GatewayRunner._load_fallback_model',staticmethod(lambda:None))
+    monkeypatch.setattr('hermes_cli.tools_config._get_platform_tools',lambda *_:set())
+    async with server(tmp_path,monkeypatch) as (_adapter,_db,client):
+        request=body(stream=True)
+        request['messages'][-1]['content']='Monitor自动核查。调用 there_devices operate monitor-dns-recovery。'
+        response=await client.post('/v1/chat/completions',headers=headers(**{DEVICE_HEADER:'synthetic'}),json=request)
+        text=await response.text()
+    assert response.status==200,text
+    assert 'event: buildstudio.monitor.outcome' in text
+    assert '"outcome": "recovered"' in text
+    assert 'MODEL CLAIM' not in text
+
+
+@pytest.mark.asyncio
 async def test_device_receipt_reaches_http_client_before_final_model_response(tmp_path, monkeypatch):
     import threading
     from gateway.there_chat_scope import record_device_result, DEVICE_HEADER
