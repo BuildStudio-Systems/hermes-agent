@@ -31,7 +31,9 @@ from typing import Any, Dict, Iterator, List, Optional
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
-NOTEPAD_FILE = get_hermes_home().resolve() / "cron" / "notepad.db"
+# Optional explicit override, matching the execution ledger. Resolve normal
+# profiles at operation time instead of pinning the import-time profile.
+NOTEPAD_FILE = None
 MAX_VALUE_BYTES = 16 * 1024
 MAX_KEY_CHARS = 128
 MAX_JOB_TOTAL_BYTES = 64 * 1024
@@ -41,11 +43,18 @@ _lock = threading.RLock()
 def _connect() -> sqlite3.Connection:
     from cron.jobs import _ensure_cron_dir
 
-    _ensure_cron_dir(NOTEPAD_FILE.parent)
-    return sqlite3.connect(NOTEPAD_FILE, timeout=5)
+    path = NOTEPAD_FILE or (get_hermes_home().resolve() / 'cron' / 'notepad.db')
+    from hermes_cli.postgres_runtime import connection_for
+    postgres = connection_for('cron_notes', path)
+    if postgres is not None:
+        return postgres
+    _ensure_cron_dir(path.parent)
+    return sqlite3.connect(path, timeout=5)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
+    if getattr(conn, 'is_postgres', False):
+        return
     from hermes_state import apply_wal_with_fallback
 
     conn.row_factory = sqlite3.Row
@@ -99,9 +108,11 @@ def set_note(job_id: str, key: str, value: str) -> Dict[str, Any]:
     _validate(job_id, key, value)
     now = _hermes_now().isoformat()
     with _transaction() as conn:
+        byte_size = ('octet_length(key) + octet_length(value)'
+                     if getattr(conn, 'is_postgres', False)
+                     else 'LENGTH(CAST(key AS BLOB)) + LENGTH(CAST(value AS BLOB))')
         row = conn.execute(
-            """SELECT COALESCE(SUM(LENGTH(CAST(key AS BLOB))
-                 + LENGTH(CAST(value AS BLOB))), 0)
+            f"""SELECT COALESCE(SUM({byte_size}), 0)
                FROM cron_notepad WHERE job_id=? AND key<>?""",
             (job_id, key),
         ).fetchone()
@@ -157,7 +168,9 @@ def clear_notepad(job_id: str) -> int:
     Called from ``cron.jobs.remove_job`` so deleted jobs don't orphan their
     rows. No-ops without creating the DB when no notepad file exists yet.
     """
-    if not NOTEPAD_FILE.exists():
+    path = NOTEPAD_FILE or (get_hermes_home().resolve() / 'cron' / 'notepad.db')
+    from hermes_cli.postgres_runtime import configuration
+    if configuration('cron_notes', path) is None and not path.exists():
         return 0
     with _transaction() as conn:
         cur = conn.execute(

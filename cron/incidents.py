@@ -56,6 +56,10 @@ def _connect() -> sqlite3.Connection:
     from cron.jobs import _ensure_cron_dir
 
     path = _db_path()
+    from hermes_cli.postgres_runtime import connection_for
+    postgres = connection_for('cron', path)
+    if postgres is not None:
+        return postgres
     _ensure_cron_dir(path.parent)
     return sqlite3.connect(path, timeout=5)
 
@@ -81,6 +85,8 @@ def _db_path() -> Path:
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
+    if getattr(conn, 'is_postgres', False):
+        return
     from hermes_state import apply_wal_with_fallback
 
     conn.row_factory = sqlite3.Row

@@ -31,11 +31,17 @@ def _connect() -> sqlite3.Connection:
     from cron.jobs import _ensure_cron_dir
 
     path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
+    from hermes_cli.postgres_runtime import connection_for
+    postgres = connection_for('cron', path)
+    if postgres is not None:
+        return postgres
     _ensure_cron_dir(path.parent)
     return sqlite3.connect(path, timeout=5)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
+    if getattr(conn, 'is_postgres', False):
+        return  # Offline owner migration; runtime has no DDL permissions.
     from hermes_state import apply_wal_with_fallback
 
     conn.row_factory = sqlite3.Row
@@ -128,11 +134,12 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
     limit = max(0, int(MAX_TERMINAL_EXECUTIONS))
+    unlimited = 'ALL' if getattr(conn, 'is_postgres', False) else '-1'
     conn.execute(
-        """DELETE FROM executions WHERE id IN (
+        f"""DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
              WHERE status IN ('completed','failed','unknown')
-             ORDER BY claimed_at DESC, id DESC LIMIT -1 OFFSET ?
+             ORDER BY claimed_at DESC, id DESC LIMIT {unlimited} OFFSET ?
            )""",
         (limit,),
     )

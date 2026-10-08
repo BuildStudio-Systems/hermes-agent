@@ -23,6 +23,8 @@ SCOPES = {
     "artifacts": ("cache/chat-files/index.sqlite3", ("chat_file_artifacts",)),
     "verification": ("verification_evidence.db", ("meta", "verification_events", "verification_state")),
     "kanban": ("kanban.db", ("board_registry", "board_fs_operations", "tasks", "task_links", "task_comments", "task_events", "task_runs", "task_attachments", "kanban_notify_subs")),
+    "cron": ("cron/executions.db", ("executions", "cron_incidents")),
+    "cron_notes": ("cron/notepad.db", ("cron_notepad",)),
 }
 _pools = {}
 _pool_lock = threading.Lock()
