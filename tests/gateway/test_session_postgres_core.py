@@ -20,6 +20,9 @@ def database(profile):
     from psycopg import sql
     path, settings = profile
     with psycopg.connect(**settings['connection']) as db:
+        # Core and insights fixtures run in separate processes against one test
+        # cluster. IF NOT EXISTS alone does not serialize extension creation.
+        db.execute('SELECT pg_advisory_xact_lock(76322008001)')
         db.execute('CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public')
         db.execute(sql.SQL('SET search_path TO {}').format(sql.Identifier(settings['schema'])))
         db.execute((Path(__file__).resolve().parents[2]/'hermes_cli/session_postgres_runtime.sql').read_text())
@@ -45,6 +48,23 @@ def test_transcript_prompt_and_usage_roundtrip(database):
     rows = db.list_sessions_rich()
     assert rows[0]['id'] == 'session'
     assert '你好' in rows[0]['preview']
+
+
+def test_multimodal_unicode_search_preserves_original_content(database):
+    value = [{'type':'text','text':'迁移核验 日本語 résumé'},
+             {'type':'image_url','image_url':{'url':'https://example.invalid/private-image'}}]
+    database.create_session('multimodal-search', source='api')
+    database.append_message('multimodal-search', 'user', value)
+    assert database.get_messages('multimodal-search')[0]['content'] == value
+    for term in ('迁移核验', '日本語', 'résumé'):
+        result = database.search_messages(term)
+        assert result and result[0]['session_id'] == 'multimodal-search', term
+        assert term in result[0]['snippet']
+    exported = database.export_session('multimodal-search')
+    database.delete_session('multimodal-search')
+    database.import_sessions([exported])
+    assert database.search_messages('迁移核验')
+    assert database.get_messages('multimodal-search')[0]['content'] == value
 
 
 def test_public_constructor_selects_native_store_without_local_database(database):
@@ -272,10 +292,7 @@ def test_gateway_handles_use_native_backend_and_restore_background_scope(databas
     from gateway.run import GatewayRunner
     import threading
     monkeypatch.setattr(hermes_state, 'DEFAULT_DB_PATH', hermes_state._IMPORT_DEFAULT_DB_PATH)
-    # Ordinary factory activation is still gated; exercise the exact consumer
-    # path using the already tested native constructor in isolation.
-    monkeypatch.setattr(hermes_state, 'SessionDB', lambda db_path=None, **kw:
-                        PostgresSessionDB(db_path or get_hermes_home()/'state.db', **kw))
+    # Exercise the public factory rather than injecting a native test override.
     store = SessionStore(database.db_path.parent/'sessions', GatewayConfig())
     runner = object.__new__(GatewayRunner)
     runner.session_store = store

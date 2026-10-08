@@ -36,9 +36,12 @@ def compile_terms(database, query):
             words = re.findall(r'[^\W_]+', term, re.UNICODE)
             if not words:
                 continue
-            pattern = r'\m' + r'[^[:alnum:]]+'.join(re.escape(w) for w in words)
+            # Test adjacent characters instead of requiring the term's own
+            # first/last characters to be locale-classified as word characters.
+            # A C-locale database otherwise cannot find literal "résumé".
+            pattern = r'(?<![[:alnum:]_])' + r'[^[:alnum:]]+'.join(re.escape(w) for w in words)
             if not prefix:
-                pattern += r'\M'
+                pattern += r'(?![[:alnum:]_])'
         groups[-1].append((pattern, negate))
         negate = False
     return [group for group in groups if any(not negative for _, negative in group)]

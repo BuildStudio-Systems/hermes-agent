@@ -268,3 +268,18 @@ create tables. This does not substitute for the final production-role check.
 Production activation still requires a new stopped-writer snapshot, verified
 import, independent PostgreSQL dump restore and actual runtime-role acceptance.
 Source support alone does not mean production state.db has been retired.
+
+## Production-role preflight correction (2026-10-08)
+
+The first production-role check caught missing multilingual search in legacy
+multimodal JSON: escaped Unicode preserved the message but made visible text
+unsearchable. The reversible envelope now includes validated derived search
+text while retaining the exact original payload. Explicit adjacent-character
+checks also find accented literal terms on C-locale PostgreSQL clusters.
+The original runtime was resumed; the unactivated import remains recovery evidence.
+
+Canonical regression: 153 passed, zero failed, three files, with no retries.
+The first run exposed concurrent test extension creation; fixture initialization
+now uses a transaction advisory lock. All 256 historical exports, rich listings
+and conversations still match the protected snapshot. Production cutover remains
+conditional on a fresh snapshot and successful runtime-role/restore checks.
