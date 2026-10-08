@@ -93,6 +93,10 @@ def _db_path():
 
 def _connect() -> sqlite3.Connection:
     path = _db_path()
+    from hermes_cli.session_postgres import connection_for
+    native = connection_for(path)
+    if native is not None:
+        return native
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=10)
     try:
@@ -246,11 +250,18 @@ def record_obligation(
     pid, started = _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            """INSERT OR REPLACE INTO delivery_obligations
+            """INSERT INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at, adapter_profile)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)
+               ON CONFLICT(obligation_id) DO UPDATE SET
+                 session_key=excluded.session_key, platform=excluded.platform,
+                 chat_id=excluded.chat_id, thread_id=excluded.thread_id,
+                 content=excluded.content, state=excluded.state, attempts=0,
+                 created_at=excluded.created_at, updated_at=excluded.updated_at,
+                 owner_pid=excluded.owner_pid, owner_started_at=excluded.owner_started_at,
+                 adapter_profile=excluded.adapter_profile, last_error=NULL""",
             (obligation_id, session_key, platform, str(chat_id),
              str(thread_id) if thread_id else None, content, now, now,
              pid, started, stored_profile),
@@ -289,7 +300,7 @@ def release_runtime_claim(obligation_id: str, error: str = "") -> bool:
                        WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
                    updated_at=?, last_error=?
                WHERE obligation_id=? AND state='attempting'
-                 AND owner_pid IS ? AND owner_started_at IS ?""",
+                 AND owner_pid IS NOT DISTINCT FROM ? AND owner_started_at IS NOT DISTINCT FROM ?""",
             (time.time(), error[:500] if error else None,
              obligation_id, pid, started),
         )
@@ -371,7 +382,7 @@ def sweep_recoverable(
                 """UPDATE delivery_obligations
                    SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
                        updated_at=?
-                   WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""",
+                   WHERE obligation_id=? AND (owner_pid IS NOT DISTINCT FROM ? OR owner_pid=?)""",
                 (pid, started, now, oid, owner_pid, owner_pid),
             )
             if cursor.rowcount:
@@ -466,7 +477,7 @@ def sweep_failed_for_runtime(
                     """UPDATE delivery_obligations
                        SET state='abandoned', updated_at=?
                        WHERE obligation_id=? AND state='failed'
-                         AND owner_pid IS ? AND owner_started_at IS ?""",
+                         AND owner_pid IS NOT DISTINCT FROM ? AND owner_started_at IS NOT DISTINCT FROM ?""",
                     (now, *owner_guard),
                 )
                 continue
@@ -474,7 +485,7 @@ def sweep_failed_for_runtime(
                 """UPDATE delivery_obligations
                    SET state='attempting', attempts=attempts+1, updated_at=?
                    WHERE obligation_id=? AND state='failed'
-                     AND owner_pid IS ? AND owner_started_at IS ?""",
+                     AND owner_pid IS NOT DISTINCT FROM ? AND owner_started_at IS NOT DISTINCT FROM ?""",
                 (now, *owner_guard),
             )
             if cursor.rowcount:

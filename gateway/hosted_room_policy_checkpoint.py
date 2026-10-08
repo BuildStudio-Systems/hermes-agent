@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
+from hermes_cli.postgres_runtime import begin_write
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -47,6 +49,10 @@ class HostedRoomPolicyCheckpoint:
     def _connect(self) -> sqlite3.Connection:
         from hermes_state import apply_wal_with_fallback
 
+        from hermes_cli.session_postgres import connection_for
+        native = connection_for(self.db_path)
+        if native is not None:
+            return native
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
@@ -54,7 +60,9 @@ class HostedRoomPolicyCheckpoint:
         return conn
 
     def _initialize(self) -> None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
+            if getattr(conn, 'is_postgres', False):
+                return
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS hosted_room_policy_cursors (
                     room_id TEXT PRIMARY KEY,
@@ -151,9 +159,9 @@ class HostedRoomPolicyCheckpoint:
         discussion_event_id: str,
     ) -> None:
         conn.execute(
-            """INSERT OR IGNORE INTO hosted_room_policy_events(
+            """INSERT INTO hosted_room_policy_events(
                    room_id, thread_id, discussion_event_id, seq, event_json
-               ) VALUES (?, ?, ?, ?, ?)""",
+               ) VALUES (?, ?, ?, ?, ?) ON CONFLICT(room_id, seq) DO NOTHING""",
             (
                 event["room_id"],
                 thread_id,
@@ -357,9 +365,9 @@ class HostedRoomPolicyCheckpoint:
                 )
                 if task_id:
                     conn.execute(
-                        """INSERT OR IGNORE INTO hosted_room_policy_publications(
+                        """INSERT INTO hosted_room_policy_publications(
                                room_id, task_id, kind, execution_generation, seq
-                           ) VALUES (?, ?, ?, ?, ?)""",
+                           ) VALUES (?, ?, ?, ?, ?) ON CONFLICT(room_id, task_id, kind, execution_generation) DO NOTHING""",
                         (
                             room_id,
                             task_id,
@@ -406,10 +414,7 @@ class HostedRoomPolicyCheckpoint:
                                room_id, thread_id, member_id, seen_through_seq
                            ) VALUES (?, ?, ?, ?)
                            ON CONFLICT(room_id, thread_id, member_id) DO UPDATE SET
-                               seen_through_seq=MAX(
-                                   hosted_room_policy_watermarks.seen_through_seq,
-                                   excluded.seen_through_seq
-                               )""",
+                               seen_through_seq=CASE WHEN hosted_room_policy_watermarks.seen_through_seq > excluded.seen_through_seq THEN hosted_room_policy_watermarks.seen_through_seq ELSE excluded.seen_through_seq END""",
                         (room_id, thread_id, member_id, seen_through_seq),
                     )
             return
@@ -432,25 +437,25 @@ class HostedRoomPolicyCheckpoint:
         if kind == "room.stop_requested":
             conn.execute(
                 """UPDATE hosted_room_policy_cursors
-                   SET stopped_through_seq=MAX(stopped_through_seq, ?)
+                   SET stopped_through_seq=CASE WHEN stopped_through_seq > ? THEN stopped_through_seq ELSE ? END
                    WHERE room_id=?""",
-                (seq, room_id),
+                (seq, seq, room_id),
             )
 
     def sync(self, *, room_id: str, latest_seq: int) -> int:
         """Materialize each unseen event exactly once by durable cursor."""
 
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with closing(self._connect()) as conn, conn:
+            begin_write(conn)
             if conn.execute(
                 "SELECT 1 FROM hosted_rooms WHERE room_id=?",
                 (room_id,),
             ).fetchone() is None:
                 raise hosted_rooms.RoomNotFoundError("hosted room not found")
             conn.execute(
-                """INSERT OR IGNORE INTO hosted_room_policy_cursors(
+                """INSERT INTO hosted_room_policy_cursors(
                        room_id, through_seq, stopped_through_seq, updated_at
-                   ) VALUES (?, 0, 0, 0)""",
+                   ) VALUES (?, 0, 0, 0) ON CONFLICT(room_id) DO NOTHING""",
                 (room_id,),
             )
             row = conn.execute(
@@ -497,8 +502,8 @@ class HostedRoomPolicyCheckpoint:
             next_cursor = int(page.get("cursor") or cursor)
             if not rows or next_cursor <= cursor:
                 raise RuntimeError("hosted room policy cursor did not advance")
-            with self._connect() as conn:
-                conn.execute("BEGIN IMMEDIATE")
+            with closing(self._connect()) as conn, conn:
+                begin_write(conn)
                 if conn.execute(
                     "SELECT 1 FROM hosted_rooms WHERE room_id=?",
                     (room_id,),
@@ -524,7 +529,7 @@ class HostedRoomPolicyCheckpoint:
         """Return only the oldest active discussion and its watermark set."""
 
         through_seq = self.sync(room_id=room_id, latest_seq=latest_seq)
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             cursor = conn.execute(
                 """SELECT stopped_through_seq FROM hosted_room_policy_cursors
                    WHERE room_id=?""",
@@ -599,7 +604,7 @@ class HostedRoomPolicyCheckpoint:
 
         kind = f"turn.{status}"
         generation = execution_generation if status == "deferred" else 0
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             if status == "deferred":
                 row = conn.execute(
                     """SELECT 1 FROM hosted_room_policy_publications
@@ -625,7 +630,7 @@ class HostedRoomPolicyCheckpoint:
     ) -> list[dict[str, Any]]:
         """Load one bounded discussion projection for terminal reconstruction."""
 
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             source = conn.execute(
                 """SELECT discussion_event_id, thread_id
                    FROM hosted_room_policy_events
@@ -663,7 +668,7 @@ class HostedRoomPolicyCheckpoint:
     def compact_completed(self, *, room_id: str) -> None:
         """Drop any completed projections left by an interrupted sync."""
 
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             completed = conn.execute(
                 """SELECT discussion_event_id FROM hosted_room_policy_threads
                    WHERE room_id=? AND completed=1""",

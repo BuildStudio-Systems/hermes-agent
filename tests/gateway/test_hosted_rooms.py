@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import pytest
@@ -91,7 +92,7 @@ def _disband(db, **kwargs):
 def _assert_retired_identity_stays_reserved(db, room_id, *, fresh_id):
     # Reopen the database to prove the reservation is durable rather than a
     # process-local cache, while the heavier room/event payload is gone.
-    with sqlite3.connect(db) as conn:
+    with closing(rooms._read_connection(db)) as conn:
         assert (
             conn.execute(
                 "SELECT 1 FROM hosted_rooms WHERE room_id=?", (room_id,)

@@ -127,6 +127,10 @@ def _db_path():
 
 def _connect() -> sqlite3.Connection:
     path = _db_path()
+    from hermes_cli.session_postgres import connection_for
+    native = connection_for(path)
+    if native is not None:
+        return native
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=10)
     try:
@@ -261,12 +265,22 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
     }
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            """INSERT OR REPLACE INTO async_delegations
+            """INSERT INTO async_delegations
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
                 owner_started_at, task_json, origin_session_id)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)
+               ON CONFLICT(delegation_id) DO UPDATE SET
+                 origin_session=excluded.origin_session,
+                 origin_ui_session_id=excluded.origin_ui_session_id,
+                 parent_session_id=excluded.parent_session_id, state=excluded.state,
+                 dispatched_at=excluded.dispatched_at, updated_at=excluded.updated_at,
+                 delivery_state=excluded.delivery_state, delivery_attempts=0,
+                 owner_pid=excluded.owner_pid, owner_started_at=excluded.owner_started_at,
+                 task_json=excluded.task_json, origin_session_id=excluded.origin_session_id,
+                 completed_at=NULL, event_json=NULL, result_json=NULL, delivered_at=NULL,
+                 delivery_claim=NULL, delivery_claimed_at=NULL""",
             (record["delegation_id"], record.get("session_key", ""),
              record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
              record["dispatched_at"], now, __import__("os").getpid(),

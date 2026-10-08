@@ -25,6 +25,7 @@ SCOPES = {
     "kanban": ("kanban.db", ("board_registry", "board_fs_operations", "tasks", "task_links", "task_comments", "task_events", "task_runs", "task_attachments", "kanban_notify_subs")),
     "cron": ("cron/executions.db", ("executions", "cron_incidents")),
     "cron_notes": ("cron/notepad.db", ("cron_notepad",)),
+    "sessions": ("state.db", ("schema_version", "sessions", "messages")),
 }
 _pools = {}
 _pool_lock = threading.Lock()
@@ -140,6 +141,16 @@ def configuration(scope: str, db_path=None):
 
 
 def connection_for(scope: str, db_path=None):
+    if scope == 'sessions':
+        from hermes_cli.session_postgres import connection_for as session_connection
+        conn = session_connection(db_path)
+        if conn is not None:
+            try:
+                conn.validate_schema()
+            except BaseException:
+                conn.close()
+                raise
+        return conn
     if scope == 'kanban':
         from hermes_cli.kanban_postgres import connect_if_configured
         return connect_if_configured(db_path or get_hermes_home()/'kanban.db')

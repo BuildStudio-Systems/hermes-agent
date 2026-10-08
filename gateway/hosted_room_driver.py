@@ -448,6 +448,10 @@ def _connect(db_path: Path | str) -> sqlite3.Connection:
     from hermes_state import apply_wal_with_fallback
 
     path = Path(db_path)
+    from hermes_cli.session_postgres import connection_for
+    native = connection_for(path)
+    if native is not None:
+        return native
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=10)
     conn.row_factory = sqlite3.Row
@@ -478,7 +482,8 @@ def _connect(db_path: Path | str) -> sqlite3.Connection:
 def _transaction(db_path: Path | str) -> Iterator[sqlite3.Connection]:
     conn = _connect(db_path)
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        from hermes_cli.postgres_runtime import begin_write
+        begin_write(conn)
         yield conn
         conn.commit()
     except Exception:

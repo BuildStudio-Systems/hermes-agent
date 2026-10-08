@@ -590,9 +590,9 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     # heavier room/event payloads. This compact registry is intentionally
     # permanent: a stale coordinate must never name a different Group Chat.
     conn.execute(
-        """INSERT OR IGNORE INTO hosted_room_retired_ids (room_id, retired_at)
+        """INSERT INTO hosted_room_retired_ids (room_id, retired_at)
            SELECT room_id, disbanded_at FROM hosted_rooms
-            WHERE disbanded_at IS NOT NULL"""
+            WHERE disbanded_at IS NOT NULL ON CONFLICT(room_id) DO NOTHING"""
     )
     _migrate_remote_run_schema(conn)
     conn.execute(
@@ -657,7 +657,7 @@ def list_room_link_records(db_path: Path | str) -> list[dict[str, Any]]:
     """Return private RoomLink records without logging or formatting grants."""
     with _transaction(db_path) as conn:
         rows = conn.execute(
-            """SELECT room_id, member_id, target_url, target_profile, grant,
+            """SELECT room_id, member_id, target_url, target_profile, "grant",
                       catalog_json, cancellation_scope_id, trace_id,
                       transport_security, status, updated_at
                  FROM hosted_room_links
@@ -686,14 +686,14 @@ def upsert_room_link_record(
                 raise HostedRoomError("too many stored room links")
         conn.execute(
             """INSERT INTO hosted_room_links(
-                   room_id, member_id, target_url, target_profile, grant,
+                   room_id, member_id, target_url, target_profile, "grant",
                    catalog_json, cancellation_scope_id, trace_id,
                    transport_security, status, updated_at
                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(room_id, member_id) DO UPDATE SET
                    target_url=excluded.target_url,
                    target_profile=excluded.target_profile,
-                   grant=excluded.grant,
+                   "grant"=excluded."grant",
                    catalog_json=excluded.catalog_json,
                    cancellation_scope_id=excluded.cancellation_scope_id,
                    trace_id=excluded.trace_id,
@@ -791,13 +791,12 @@ def revoke_room_grant_scope(
             (timestamp,),
         )
         conn.execute(
-            """INSERT INTO hosted_room_revoked_grants(
+            f"""INSERT INTO hosted_room_revoked_grants(
                    scope_key, expires_at, revoked_before
                ) VALUES (?, ?, ?)
                ON CONFLICT(scope_key) DO UPDATE SET
-                   expires_at=MAX(hosted_room_revoked_grants.expires_at,
-                                  excluded.expires_at),
-                   revoked_before=MAX(hosted_room_revoked_grants.revoked_before,
+                   expires_at=CASE WHEN hosted_room_revoked_grants.expires_at > excluded.expires_at THEN hosted_room_revoked_grants.expires_at ELSE excluded.expires_at END,
+                   revoked_before={'GREATEST' if getattr(conn, 'is_postgres', False) else 'MAX'}(hosted_room_revoked_grants.revoked_before,
                                       excluded.revoked_before)""",
             (scope_key, expiry, timestamp),
         )
@@ -895,14 +894,14 @@ def reserve_peer_room(
         ):
             raise AuthorityConflictError("peer room reservation authority changed")
         conn.execute(
-            """INSERT INTO hosted_room_peer_reservations(
+            f"""INSERT INTO hosted_room_peer_reservations(
                    room_id, member_id, target_profile, authority_gateway_id,
                    authority_epoch, expires_at, revoked_at, created_at, updated_at
                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
                ON CONFLICT(room_id, member_id, target_profile) DO UPDATE SET
                    authority_gateway_id=excluded.authority_gateway_id,
                    authority_epoch=excluded.authority_epoch,
-                   expires_at=MAX(hosted_room_peer_reservations.expires_at,
+                   expires_at={'GREATEST' if getattr(conn, 'is_postgres', False) else 'MAX'}(hosted_room_peer_reservations.expires_at,
                                   excluded.expires_at),
                    revoked_at=NULL,
                    updated_at=excluded.updated_at""",
@@ -1115,6 +1114,10 @@ def _connect(db_path: Path | str) -> sqlite3.Connection:
     from hermes_state import apply_wal_with_fallback
 
     path = Path(db_path)
+    from hermes_cli.session_postgres import connection_for
+    native = connection_for(path)
+    if native is not None:
+        return native
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=10)
     conn.row_factory = sqlite3.Row
@@ -1153,6 +1156,10 @@ def _read_connection(db_path: Path | str) -> sqlite3.Connection:
     """Open the room store without steady-state journal or migration writes."""
 
     path = Path(db_path)
+    from hermes_cli.session_postgres import connection_for
+    native = connection_for(path, read_only=True)
+    if native is not None:
+        return native
     if not path.is_file():
         initialized = _connect(path)
         initialized.close()
@@ -1176,8 +1183,9 @@ def _transaction(
 ) -> Iterator[sqlite3.Connection]:
     conn = _connect(db_path)
     try:
-        if immediate:
-            conn.execute("BEGIN IMMEDIATE")
+        if immediate or getattr(conn, 'is_postgres', False):
+            from hermes_cli.postgres_runtime import begin_write
+            begin_write(conn)
         yield conn
         conn.commit()
     except Exception:
@@ -1205,16 +1213,6 @@ def _raise_room_not_found(conn: sqlite3.Connection, room_id: str) -> NoReturn:
             "Group Chat history expired; room_id remains permanently retired"
         )
     raise RoomNotFoundError("hosted room not found")
-
-
-def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
-    return (
-        conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-            (table,),
-        ).fetchone()
-        is not None
-    )
 
 
 def _room_from_row(row: sqlite3.Row, *, idempotent: bool = False) -> dict[str, Any]:
@@ -1290,6 +1288,11 @@ def _assert_event_capacity(
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    if getattr(conn, 'is_postgres', False):
+        return conn.execute(
+            'SELECT 1 FROM information_schema.tables WHERE table_schema=current_schema() AND table_name=?',
+            (table,),
+        ).fetchone() is not None
     return (
         conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
@@ -1319,10 +1322,10 @@ def _prune_disbanded_rooms_locked(
     candidates.update(
         str(row["room_id"])
         for row in conn.execute(
-            """SELECT room_id FROM hosted_rooms
+            f"""SELECT room_id FROM hosted_rooms
                  WHERE disbanded_at IS NOT NULL
                  ORDER BY disbanded_at DESC, room_id ASC
-                 LIMIT -1 OFFSET ?""",
+                 LIMIT {'ALL' if getattr(conn, 'is_postgres', False) else '-1'} OFFSET ?""",
             (MAX_DISBANDED_ROOM_TOMBSTONES,),
         ).fetchall()
     )
@@ -1350,9 +1353,9 @@ def _prune_disbanded_rooms_locked(
     placeholders = ",".join("?" for _ in candidates)
     room_ids = tuple(sorted(candidates))
     conn.execute(
-        f"""INSERT OR IGNORE INTO hosted_room_retired_ids (room_id, retired_at)
+        f"""INSERT INTO hosted_room_retired_ids (room_id, retired_at)
             SELECT room_id, disbanded_at FROM hosted_rooms
-             WHERE room_id IN ({placeholders}) AND disbanded_at IS NOT NULL""",
+             WHERE room_id IN ({placeholders}) AND disbanded_at IS NOT NULL ON CONFLICT(room_id) DO NOTHING""",
         room_ids,
     )
     dependent_tables = (
@@ -1608,7 +1611,7 @@ def list_rooms(
                       authority_epoch, next_seq, revision, created_at, updated_at,
                       disbanded_at
                FROM hosted_rooms
-               WHERE disbanded_at IS NULL OR ?
+               WHERE disbanded_at IS NULL OR ? = 1
                ORDER BY updated_at DESC, room_id ASC
                LIMIT ? OFFSET ?""",
             (int(include_disbanded), limit, offset),
@@ -1880,6 +1883,18 @@ def probe_hosted_room(db_path: Path | str, *, room_id: Any) -> bool:
         max_chars=MAX_ROOM_ID_CHARS,
     )
     path = Path(db_path)
+    from hermes_cli.session_postgres import connection_for
+    native = connection_for(path, read_only=True, timeout=0.05)
+    if native is not None:
+        try:
+            return native.execute(
+                "SELECT 1 FROM hosted_rooms WHERE room_id=? AND disbanded_at IS NULL LIMIT 1",
+                (checked_room_id,),
+            ).fetchone() is not None
+        except Exception as exc:
+            raise RoomProbeUnavailableError("hosted room ownership is temporarily unavailable") from exc
+        finally:
+            native.close()
     if not path.is_file():
         return False
     try:
@@ -1926,10 +1941,22 @@ def probe_peer_room_reservation(
         label="target_profile",
         max_chars=MAX_ACTOR_ID_CHARS,
     )
+    checked_now = float(now if now is not None else time.time())
     path = Path(db_path)
+    from hermes_cli.session_postgres import connection_for
+    native = connection_for(path, read_only=True, timeout=0.05)
+    if native is not None:
+        try:
+            return native.execute(
+                "SELECT 1 FROM hosted_room_peer_reservations WHERE room_id=? AND target_profile=? AND expires_at>? AND revoked_at IS NULL LIMIT 1",
+                (checked_room_id, checked_profile, checked_now),
+            ).fetchone() is not None
+        except Exception as exc:
+            raise RoomProbeUnavailableError("peer room ownership is temporarily unavailable") from exc
+        finally:
+            native.close()
     if not path.is_file():
         return False
-    checked_now = float(now if now is not None else time.time())
     try:
         conn = sqlite3.connect(path, timeout=0.05)
         try:
@@ -1975,7 +2002,7 @@ def room_state(
                       authority_epoch, next_seq, revision, created_at, updated_at,
                       disbanded_at
                  FROM hosted_rooms
-                WHERE room_id=? AND (disbanded_at IS NULL OR ?)""",
+                WHERE room_id=? AND (disbanded_at IS NULL OR ? = 1)""",
             (room_id, int(include_disbanded)),
         ).fetchone()
         if row is None:
@@ -2241,8 +2268,8 @@ def disband_room(
             }
         if room["disbanded_at"] is not None:
             conn.execute(
-                """INSERT OR IGNORE INTO hosted_room_retired_ids
-                   (room_id, retired_at) VALUES (?, ?)""",
+                """INSERT INTO hosted_room_retired_ids
+                   (room_id, retired_at) VALUES (?, ?) ON CONFLICT(room_id) DO NOTHING""",
                 (room_id, float(room["disbanded_at"])),
             )
             event = conn.execute(
@@ -2322,8 +2349,8 @@ def disband_room(
         if updated.rowcount != 1:
             raise RoomConflictError("hosted room disband lost its fence")
         conn.execute(
-            """INSERT OR IGNORE INTO hosted_room_retired_ids
-               (room_id, retired_at) VALUES (?, ?)""",
+            """INSERT INTO hosted_room_retired_ids
+               (room_id, retired_at) VALUES (?, ?) ON CONFLICT(room_id) DO NOTHING""",
             (room_id, now),
         )
         event = conn.execute(
@@ -2375,7 +2402,7 @@ def read_events(
         room = conn.execute(
             """SELECT next_seq, authority_gateway_id, authority_epoch
                FROM hosted_rooms
-               WHERE room_id=? AND (disbanded_at IS NULL OR ?)""",
+               WHERE room_id=? AND (disbanded_at IS NULL OR ? = 1)""",
             (room_id, int(include_disbanded)),
         ).fetchone()
         if room is None:
@@ -2385,16 +2412,16 @@ def read_events(
         authority_epoch = int(room["authority_epoch"])
         if since_seq > latest_seq:
             raise HostedRoomError("since_seq is ahead of the hosted room log")
+        byte_size = " + ".join(
+            f"octet_length({column})" if getattr(conn, 'is_postgres', False)
+            else f"LENGTH(CAST({column} AS BLOB))"
+            for column in ('event_id', 'kind', 'actor_json', 'payload_json')
+        )
         rows = conn.execute(
-            """WITH candidates AS (
+            f"""WITH candidates AS (
                    SELECT room_id, seq, event_id, kind, actor_json,
                           authority_epoch, payload_json, created_at,
-                          SUM(
-                              LENGTH(CAST(event_id AS BLOB)) +
-                              LENGTH(CAST(kind AS BLOB)) +
-                              LENGTH(CAST(actor_json AS BLOB)) +
-                              LENGTH(CAST(payload_json AS BLOB))
-                          ) OVER (ORDER BY seq ASC) AS cumulative_bytes
+                          SUM({byte_size}) OVER (ORDER BY seq ASC) AS cumulative_bytes
                      FROM hosted_room_events
                     WHERE room_id=? AND seq>?
                     ORDER BY seq ASC LIMIT ?

@@ -4905,6 +4905,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # process resolved the developer's production state.db — see the
         # live-DB test-isolation guard block near _default_db_path().
         _ensure_test_isolation(self.db_path)
+        # Never allow partial activation to split transcripts and auxiliary
+        # ledgers between PostgreSQL and the retained SQLite snapshot.
+        from hermes_cli.postgres_runtime import configuration as storage_configuration
+        if storage_configuration('sessions', self.db_path) is not None:
+            raise RuntimeError('PostgreSQL session activation awaits the transcript/search runtime migration')
         self.read_only = read_only
 
         self._lock = threading.Lock()
