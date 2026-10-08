@@ -65,6 +65,10 @@ def _db_path() -> Path:
 
 
 def _connect() -> sqlite3.Connection:
+    from hermes_cli.postgres_runtime import connection_for
+    postgres = connection_for("verification")
+    if postgres is not None:
+        return postgres
     from hermes_state import apply_wal_with_fallback
 
     path = _db_path()
@@ -638,7 +642,7 @@ def _insert_evidence(evidence: VerificationEvidence) -> dict[str, Any]:
                     created_at, session_id, cwd, root, command, canonical_command,
                     kind, scope, status, exit_code, output_summary
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                """ + (" RETURNING id" if getattr(conn, "is_postgres", False) else ""),
                 (
                     created_at,
                     evidence.session_id,
@@ -653,9 +657,10 @@ def _insert_evidence(evidence: VerificationEvidence) -> dict[str, Any]:
                     evidence.output_summary,
                 ),
             )
-            if cur.lastrowid is None:
+            returned_id = cur.fetchone()[0] if getattr(conn, "is_postgres", False) else cur.lastrowid
+            if returned_id is None:
                 raise RuntimeError("verification event insert did not return an id")
-            event_id = int(cur.lastrowid)
+            event_id = int(returned_id)
             conn.execute(
                 """
                 INSERT INTO verification_state(

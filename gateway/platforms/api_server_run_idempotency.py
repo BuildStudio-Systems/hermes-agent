@@ -8,6 +8,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict
+from hermes_cli.postgres_runtime import begin_write, connection_for
 
 
 # Keep the extracted store's log records on the API server logger.
@@ -29,9 +30,17 @@ class RunIdempotencyStore:
     @property
     def durable(self) -> bool:
         """Whether reservations survive this process."""
-        return self._db_path is not None
+        return getattr(self._conn, "is_postgres", False) or self._db_path is not None
 
     def __init__(self, db_path: str = None):
+        self._greatest = "MAX"
+        postgres = connection_for("runs", db_path)
+        if postgres is not None:
+            self._conn = postgres
+            self._db_path = None
+            self._greatest = "GREATEST"
+            self._lock = threading.Lock()
+            return
         if db_path is None:
             try:
                 from hermes_cli.config import get_hermes_home
@@ -131,7 +140,7 @@ class RunIdempotencyStore:
         retention_until = max(0.0, float(retention_until or 0))
         encoded = json.dumps(status, sort_keys=True, separators=(",", ":"))
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+            begin_write(self._conn)
             try:
                 self._prune_stale_terminal_locked(now)
                 row = self._conn.execute(
@@ -142,8 +151,8 @@ class RunIdempotencyStore:
                 if row is not None:
                     if retention_until:
                         self._conn.execute(
-                            """UPDATE run_idempotency
-                                  SET retention_until=MAX(retention_until, ?)
+                            f"""UPDATE run_idempotency
+                                  SET retention_until={self._greatest}(retention_until, ?)
                                 WHERE scope=? AND idempotency_key=?
                                   AND fingerprint=?""",
                             (retention_until, scope, key, fingerprint),
@@ -203,12 +212,12 @@ class RunIdempotencyStore:
         now = time.time()
         retention_until = max(0.0, float(retention_until or 0))
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+            begin_write(self._conn)
             try:
                 if retention_until:
                     self._conn.execute(
-                        """UPDATE run_idempotency
-                              SET retention_until=MAX(retention_until, ?)
+                        f"""UPDATE run_idempotency
+                              SET retention_until={self._greatest}(retention_until, ?)
                             WHERE scope=? AND idempotency_key=?
                               AND fingerprint=?""",
                         (retention_until, scope, key, fingerprint),
@@ -305,8 +314,8 @@ class RunIdempotencyStore:
         with self._lock:
             if retention_until:
                 self._conn.execute(
-                    """UPDATE run_idempotency
-                          SET retention_until=MAX(retention_until, ?)
+                    f"""UPDATE run_idempotency
+                          SET retention_until={self._greatest}(retention_until, ?)
                         WHERE scope=? AND run_id=?""",
                     (retention_until, scope, run_id),
                 )
@@ -344,8 +353,8 @@ class RunIdempotencyStore:
             return False
         with self._lock:
             changed = self._conn.execute(
-                """UPDATE run_idempotency
-                      SET retention_until=MAX(retention_until, ?)
+                f"""UPDATE run_idempotency
+                      SET retention_until={self._greatest}(retention_until, ?)
                     WHERE scope=? AND run_id=?""",
                 (checked_until, scope, run_id),
             ).rowcount

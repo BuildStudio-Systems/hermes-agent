@@ -2,7 +2,7 @@
 
 The file bytes stay in their original, already validated location.  Only a
 random identifier crosses the API boundary; the local path is kept in a small
-SQLite index under the Hermes home directory.  Callers must validate the path
+profile-scoped database index. Callers must validate the path
 both before :meth:`publish` and after :meth:`resolve`.
 """
 
@@ -65,7 +65,7 @@ class ChatFileArtifact:
 
 
 class ChatFileArtifactStore:
-    """SQLite-backed registry of immutable file references."""
+    """Persistent registry of immutable file references."""
 
     def __init__(
         self,
@@ -77,6 +77,12 @@ class ChatFileArtifactStore:
         self.db_path = Path(db_path)
         self.ttl_seconds = max(60, int(ttl_seconds))
         self.max_bytes = max(1, int(max_bytes))
+        from hermes_cli.postgres_runtime import configuration
+        self._postgres_settings = configuration("artifacts", self.db_path)
+        if self._postgres_settings is not None:
+            with closing(self._connect()):
+                pass  # Verify offline-provisioned schema; no runtime DDL.
+            return
         self.db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._protect_path(self.db_path.parent, 0o700)
         self._initialize()
@@ -91,6 +97,9 @@ class ChatFileArtifactStore:
             pass
 
     def _connect(self) -> sqlite3.Connection:
+        if self._postgres_settings is not None:
+            from hermes_cli.postgres_runtime import Connection
+            return Connection(self._postgres_settings, "artifacts")
         connection = sqlite3.connect(str(self.db_path), timeout=5)
         connection.row_factory = sqlite3.Row
         return connection

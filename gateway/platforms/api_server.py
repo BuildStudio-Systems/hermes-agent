@@ -1018,20 +1018,39 @@ def check_api_server_requirements() -> bool:
     return AIOHTTP_AVAILABLE
 
 
+def _serialized_response_store(method):
+    @wraps(method)
+    def operation(self, *args, **kwargs):
+        with self._store_lock:
+            try:
+                return method(self, *args, **kwargs)
+            except Exception:
+                self._conn.rollback()
+                raise
+    return operation
+
+
 class ResponseStore:
     """
-    SQLite-backed LRU store for Responses API state.
+    Persistent LRU store for Responses API state.
 
     Each stored response includes the full internal conversation history
     (with tool calls and results) so it can be reconstructed on subsequent
     requests via previous_response_id.
 
-    Persists across gateway restarts.  Falls back to in-memory SQLite
-    if the on-disk path is unavailable.
+    PostgreSQL profiles fail closed. Legacy local profiles retain their
+    existing SQLite behavior until explicitly migrated.
     """
 
     def __init__(self, max_size: int = MAX_STORED_RESPONSES, db_path: str = None):
         self._max_size = max_size
+        self._store_lock = threading.RLock()
+        from hermes_cli.postgres_runtime import connection_for
+        postgres = connection_for("responses", db_path)
+        if postgres is not None:
+            self._conn = postgres
+            self._db_path = None
+            return
         if db_path is None:
             try:
                 from hermes_cli.config import get_hermes_home
@@ -1090,6 +1109,7 @@ class ResponseStore:
                     exc_info=True,
                 )
 
+    @_serialized_response_store
     def get(self, response_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve a stored response by ID (updates access time for LRU)."""
         row = self._conn.execute(
@@ -1116,10 +1136,12 @@ class ResponseStore:
             self._conn.commit()
             return None
 
+    @_serialized_response_store
     def put(self, response_id: str, data: Dict[str, Any]) -> None:
         """Store a response, evicting the oldest if at capacity."""
         self._conn.execute(
-            "INSERT OR REPLACE INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
+            "INSERT INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(response_id) DO UPDATE SET data=excluded.data, accessed_at=excluded.accessed_at",
             (response_id, json.dumps(data, default=str), time.time()),
         )
         # Evict oldest entries beyond max_size
@@ -1147,6 +1169,7 @@ class ResponseStore:
                 )
         self._conn.commit()
 
+    @_serialized_response_store
     def delete(self, response_id: str) -> bool:
         """Remove a response from the store. Returns True if found and deleted."""
         # Clear conversation mappings pointing to this response
@@ -1159,6 +1182,7 @@ class ResponseStore:
         self._conn.commit()
         return cursor.rowcount > 0
 
+    @_serialized_response_store
     def get_conversation(self, name: str) -> Optional[str]:
         """Get the latest response_id for a conversation name."""
         row = self._conn.execute(
@@ -1166,14 +1190,17 @@ class ResponseStore:
         ).fetchone()
         return row[0] if row else None
 
+    @_serialized_response_store
     def set_conversation(self, name: str, response_id: str) -> None:
         """Map a conversation name to its latest response_id."""
         self._conn.execute(
-            "INSERT OR REPLACE INTO conversations (name, response_id) VALUES (?, ?)",
+            "INSERT INTO conversations (name, response_id) VALUES (?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET response_id=excluded.response_id",
             (name, response_id),
         )
         self._conn.commit()
 
+    @_serialized_response_store
     def close(self) -> None:
         """Close the database connection."""
         try:
@@ -1181,6 +1208,7 @@ class ResponseStore:
         except Exception:
             pass
 
+    @_serialized_response_store
     def __len__(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()
         return row[0] if row else 0
