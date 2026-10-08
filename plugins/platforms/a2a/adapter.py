@@ -34,7 +34,6 @@ import json
 import logging
 import os
 import re
-import sqlite3
 import subprocess
 import threading
 import time
@@ -740,7 +739,14 @@ class A2AAdapter(BasePlatformAdapter):
         self._register_inline_push(task_id, params, agent=agent)
 
         if not agent.get("local", True):
-            reply, state = self._forward_to_profile(agent, peer, context_id, framed)
+            try:
+                reply, state = self._forward_to_profile(agent, peer, context_id, framed)
+            except Exception as exc:
+                # Storage errors must stop forwarding, not masquerade as a
+                # missing session and spawn a fresh conversation. Never echo
+                # SQL/connection diagnostics into the remote task response.
+                logger.warning("A2A forwarding failed (%s)", type(exc).__name__)
+                reply, state = "Forwarded agent unavailable; task was not completed.", protocol.STATE_FAILED
             self.tasks.complete(task_id, state, reply)
             protocol.persist_message(context_id, "agent", reply, task_id)
             security.audit("outbound", peer, task_id, reply)
@@ -798,55 +804,35 @@ class A2AAdapter(BasePlatformAdapter):
             "started": time.time(),
         }
 
-    def _profile_state_db(self, profile: str) -> Optional[str]:
-        home = _profile_home(profile)
-        if not home:
-            return None
-        return os.path.join(home, "state.db")
-
     def _lookup_forward_session(self, profile: str, title: str) -> str:
-        db = self._profile_state_db(profile)
-        if not db or not os.path.exists(db):
-            return ""
-        try:
-            con = sqlite3.connect(db, timeout=5)
+        from hermes_cli.profile_session_storage import profile_session_connection
+        with profile_session_connection(profile) as con:
+            if con is None:
+                return ""
             row = con.execute(
                 "SELECT id FROM sessions WHERE title = ? ORDER BY started_at DESC LIMIT 1",
                 (title,),
             ).fetchone()
-            con.close()
             return str(row[0]) if row else ""
-        except Exception:
-            logger.debug("A2A: could not lookup forwarded session", exc_info=True)
-            return ""
 
     def _latest_a2a_session(self, profile: str, started_after: float) -> str:
-        db = self._profile_state_db(profile)
-        if not db or not os.path.exists(db):
-            return ""
-        try:
-            con = sqlite3.connect(db, timeout=5)
+        from hermes_cli.profile_session_storage import profile_session_connection
+        with profile_session_connection(profile) as con:
+            if con is None:
+                return ""
             row = con.execute(
                 "SELECT id FROM sessions WHERE source = 'a2a' AND started_at >= ? ORDER BY started_at DESC LIMIT 1",
                 (started_after - 2.0,),
             ).fetchone()
-            con.close()
             return str(row[0]) if row else ""
-        except Exception:
-            logger.debug("A2A: could not find latest forwarded session", exc_info=True)
-            return ""
 
     def _title_forward_session(self, profile: str, session_id: str, title: str) -> None:
-        db = self._profile_state_db(profile)
-        if not db or not os.path.exists(db) or not session_id:
+        if not session_id:
             return
-        try:
-            con = sqlite3.connect(db, timeout=5)
-            con.execute("UPDATE sessions SET title = ? WHERE id = ?", (title, session_id))
-            con.commit()
-            con.close()
-        except Exception:
-            logger.debug("A2A: could not title forwarded session", exc_info=True)
+        from hermes_cli.profile_session_storage import profile_session_connection
+        with profile_session_connection(profile, read_only=False) as con:
+            if con is not None:
+                con.execute("UPDATE sessions SET title = ? WHERE id = ?", (title, session_id))
 
     def _forward_to_profile(self, agent: dict, peer: str, context_id: str, framed_text: str) -> tuple[str, str]:
         """Forward a routed A2A task to another local Hermes profile.

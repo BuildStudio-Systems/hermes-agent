@@ -3512,6 +3512,17 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         "error": None,
     }
 
+    # A retained pre-migration file is evidence, not the selected backend.
+    # Refuse local surgery also when backend configuration is broken.
+    try:
+        from hermes_cli.postgres_runtime import configuration
+        if configuration('sessions', db_path) is not None:
+            report['error'] = 'PostgreSQL session repair requires the database operator'
+            return report
+    except Exception as exc:
+        report['error'] = 'Session backend configuration unavailable (' + type(exc).__name__ + ')'
+        return report
+
     # Startup-watchdog progress lease: repair (raw backup copy + surgery +
     # VACUUM) is I/O-bound — near-zero CPU on a multi-GB file — which the
     # watchdog's CPU fallback would misread as a parked deadlock (OOF-298).
@@ -4514,6 +4525,12 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
         "fts_rebuild_progress": None,
         "fts_rebuild_deferral": None,
     }
+
+    from hermes_cli.session_postgres import collect_stats as collect_postgres_stats
+    native_stats = collect_postgres_stats(db_path)
+    if native_stats is not None:
+        stats.update(native_stats)
+        return stats
 
     # WAL sidecar size needs no connection at all.
     try:

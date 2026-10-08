@@ -154,3 +154,9 @@ class PostgresSessionDB(SessionDB):
 
     def optimize_fts(self):
         raise RuntimeError('PostgreSQL search maintenance is managed by the database maintenance role')
+
+    def rebuild_fts(self):
+        raise RuntimeError('PostgreSQL search maintenance is managed by the database maintenance role')
+
+    def optimize_fts_storage(self, *args, **kwargs):
+        raise RuntimeError('SQLite FTS storage conversion does not apply to PostgreSQL')

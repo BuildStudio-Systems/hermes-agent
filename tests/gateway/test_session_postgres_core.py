@@ -47,6 +47,116 @@ def test_transcript_prompt_and_usage_roundtrip(database):
     assert '你好' in rows[0]['preview']
 
 
+def test_named_profile_search_and_a2a_use_target_backend(database, tmp_path, monkeypatch):
+    from hermes_cli import profiles
+    from hermes_constants import get_hermes_home, set_hermes_home_override, reset_hermes_home_override
+    from tools.session_search_tool import _resolve_profile_db, _locate_session_db
+    from plugins.platforms.a2a.adapter import A2AAdapter
+    from gateway.config import PlatformConfig
+    from types import SimpleNamespace
+    home = database.db_path.parent
+    caller = tmp_path/'caller'
+    caller.mkdir()
+    monkeypatch.setattr(profiles, 'get_profile_dir', lambda name: home if name == 'target' else caller)
+    monkeypatch.setattr(profiles, 'list_profiles', lambda: [SimpleNamespace(name='target', path=home)])
+    database.create_session('target-session', source='a2a')
+    database.append_message('target-session', role='user', content='目标配置会话')
+    before_env = __import__('os').environ.get('HERMES_HOME')
+    token = set_hermes_home_override(caller)
+    try:
+        with _resolve_profile_db('target') as reader:
+            assert reader.is_postgres
+            assert reader.get_messages('target-session')[0]['content'] == '目标配置会话'
+            with pytest.raises(PermissionError):
+                reader.append_message('target-session', role='user', content='forbidden')
+        found, name = _locate_session_db('target-session')
+        with closing(found):
+            assert name == 'target'
+            assert found.get_session('target-session')
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={}))
+        adapter._title_forward_session('target', 'target-session', 'remote-title')
+        assert adapter._lookup_forward_session('target', 'remote-title') == 'target-session'
+        assert adapter._latest_a2a_session('target', 0) == 'target-session'
+        assert get_hermes_home() == caller
+        assert __import__('os').environ.get('HERMES_HOME') == before_env
+        assert not (caller/'state.db').exists()
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_profile_backend_failure_does_not_read_retained_sqlite(database, monkeypatch):
+    from hermes_cli import profiles
+    from hermes_cli.profile_session_storage import profile_session_connection, open_profile_session_db
+    import sqlite3
+    monkeypatch.setattr(profiles, 'get_profile_dir', lambda name: database.db_path.parent)
+    # A retained pre-migration file must never become a silent fallback.
+    with sqlite3.connect(database.db_path) as old:
+        old.execute('CREATE TABLE sessions(id TEXT)')
+        old.execute("INSERT INTO sessions VALUES ('stale')")
+    credentials = database.db_path.parent/'credentials.json'
+    original = credentials.read_text()
+    try:
+        from hermes_state import repair_state_db_schema
+        old_bytes = database.db_path.read_bytes()
+        report = repair_state_db_schema(database.db_path)
+        assert not report['repaired']
+        assert 'PostgreSQL' in report['error']
+        assert database.db_path.read_bytes() == old_bytes
+        credentials.write_text('{}')
+        with pytest.raises(ValueError, match='different Agent profile'):
+            with profile_session_connection('target'):
+                pytest.fail('must fail before yielding connection')
+        with pytest.raises(ValueError, match='different Agent profile'):
+            open_profile_session_db('target')
+        with pytest.raises(ValueError):
+            open_profile_session_db('../target')
+    finally:
+        credentials.write_text(original)
+        database.db_path.unlink()
+
+
+def test_native_diagnostics_and_maintenance_do_not_touch_local_files(database):
+    from hermes_state import collect_state_db_stats
+    from hermes_cli.doctor import _render_state_db_stats
+    database.create_session('stats-session', source='api')
+    database.append_message('stats-session', role='user', content='diagnostic')
+    stats = collect_state_db_stats(database.db_path)
+    assert stats['backend'] == 'postgresql' and stats['healthy']
+    assert stats['sessions'] == 1 and stats['messages'] == 1
+    assert stats['logical_size_bytes'] > 0
+    assert stats['wal_size_bytes'] is None
+    rendered = _render_state_db_stats(stats)
+    assert all(kind == 'info' for kind, _, _ in rendered)
+    assert 'PostgreSQL' in rendered[0][1]
+    for method in (database.vacuum, database.optimize_fts, database.rebuild_fts, database.optimize_fts_storage):
+        with pytest.raises(RuntimeError, match='PostgreSQL'):
+            method()
+    with database._read_ctx() as conn:
+        assert conn.execute('SELECT count(*) FROM sessions').fetchone()[0] == 1
+
+
+def test_native_diagnostics_missing_index_fails_without_exposing_sql(database):
+    from hermes_state import collect_state_db_stats
+    from hermes_cli.doctor import _render_state_db_stats
+    with database._conn:
+        database._conn.execute('DROP INDEX messages_content_trgm')
+    stats = collect_state_db_stats(database.db_path)
+    assert stats['healthy'] is False
+    assert stats['error'] == 'SearchIndexesUnavailable'
+    assert _render_state_db_stats(stats)[0][0] == 'warn'
+    credentials = database.db_path.parent/'credentials.json'
+    saved = credentials.read_text()
+    try:
+        credentials.write_text('{"bad-secret":"do-not-expose"}')
+        failed = collect_state_db_stats(database.db_path)
+        assert not failed['healthy']
+        assert failed['backend'] == 'unavailable'
+        assert 'do-not-expose' not in json.dumps(failed)
+        assert failed['wal_size_bytes'] is None
+    finally:
+        credentials.write_text(saved)
+
+
 def test_batch_replace_export_and_import(database):
     db = database
     db.create_session('session',source='api',user_id='owner')

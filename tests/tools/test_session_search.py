@@ -506,7 +506,7 @@ class TestCrossProfileRead:
         from collections import namedtuple
         from hermes_cli import profiles as profiles_mod
         Info = namedtuple("Info", "name path")
-        monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: tmp_path / "default_home")
+        monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: other_home if n == "asdf" else tmp_path / "default_home")
         monkeypatch.setattr(profiles_mod, "list_profiles", lambda: [Info("asdf", other_home)])
 
         # `db` (current profile) lacks s_far; no profile passed → scan finds it.
@@ -1143,4 +1143,3 @@ class TestNewResetLineageBrowse:
         result = json.loads(session_search(db=db, current_session_id="s_other"))
         sids = [r["session_id"] for r in result["results"]]
         assert "s_legacy_child" in sids
-

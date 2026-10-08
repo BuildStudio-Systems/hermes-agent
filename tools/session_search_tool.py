@@ -355,15 +355,11 @@ def _resolve_profile_db(profile: str):
     if profile is None or not str(profile).strip():
         return None
 
-    from hermes_cli import profiles as profiles_mod
-    from hermes_state import SessionDB
-
-    canon = profiles_mod.normalize_profile_name(profile)
-    profiles_mod.validate_profile_name(canon)
-    if not profiles_mod.profile_exists(canon):
-        raise ValueError(f"profile '{canon}' does not exist")
-
-    return SessionDB(db_path=profiles_mod.get_profile_dir(canon) / "state.db", read_only=True)
+    from hermes_cli.profile_session_storage import open_profile_session_db
+    db = open_profile_session_db(profile, read_only=True)
+    if db is None:
+        raise ValueError('Target profile has no session history')
+    return db
 
 
 def _session_link(session_id: str, profile: str = None) -> str:
@@ -415,11 +411,14 @@ def _locate_session_db(session_id: str):
     for name, home in targets:
         db_path = Path(home) / "state.db"
         key = str(db_path)
-        if key in seen or not db_path.exists():
+        if key in seen:
             continue
         seen.add(key)
         try:
-            pdb = SessionDB(db_path=db_path, read_only=True)
+            from hermes_cli.profile_session_storage import open_profile_session_db
+            pdb = open_profile_session_db(name, read_only=True)
+            if pdb is None:
+                continue
         except Exception:
             continue
         try:

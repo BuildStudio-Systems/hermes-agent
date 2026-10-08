@@ -185,3 +185,31 @@ Final acceptance must include real authenticated chat/history/search, owner
 isolation, task/delivery retry behavior, concurrent lease acquisition, failure
 recovery, inspection of all active database handles and scheduled DB backup
 coverage. Formal numbered Word/PDF books remain pending final cutover.
+
+
+## Named-profile consumers and diagnostics (2026-10-08, source only)
+
+Named-profile session links and A2A forwarding now resolve each registered
+profile's own storage under a context-local home override, without process
+environment changes or credential inheritance. Native storage is selected before
+checking for a retained state.db. Read-only search stays read-only; forwarding
+storage failure stops the task instead of creating a fresh conversation. Native
+schema errors and connection diagnostics are not echoed in remote task errors.
+
+Doctor and collect_state_db_stats inspect PostgreSQL schema, counts, logical
+size and the three valid/ready native search indexes. They do not checkpoint,
+repair, or vacuum retained SQLite files. Configuration failure is unavailable,
+not permission to fall back. SQLite FTS conversion/rebuild is explicitly rejected
+by the native engine; DBA maintenance remains separate from runtime DML rights.
+
+Canonical runner: **517 passed, 0 failed, 1 platform-specific skipped**, 17 files,
+including 80 native core cases, 54 native auxiliary cases and existing A2A/search/
+SQLite-stat contracts. One first-run legacy fixture had inconsistent profile
+registry/path resolution; corrected without weakening named-profile validation.
+The private production-snapshot rehearsal again matched all 256 exports,
+listings and conversation views (4,024 messages); source snapshot stayed unchanged.
+
+This is not production activation. The ordinary SessionDB constructor still
+rejects sessions selection until backup/restore, remaining direct consumers and
+final cutover acceptance are complete. Running release remains
+20261008-cron-postgres; final numbered Word/PDF publication is pending.

@@ -425,6 +425,14 @@ def _render_state_db_stats(stats: dict, holders=None) -> list:
     lines: list = []
     stats = stats or {}
 
+    if stats.get('backend') in ('postgresql', 'unavailable'):
+        if not stats.get('healthy'):
+            return [('warn', 'Session backend unavailable',
+                     '(' + str(stats.get('error', 'unknown')) + '; no local fallback or repair performed)')]
+        size = _human_bytes(stats.get('logical_size_bytes', 0))
+        return [('info', f"PostgreSQL sessions: {stats['sessions']:,} sessions, {stats['messages']:,} messages; schema size {size}", ''),
+                ('info', 'Native search indexes ready', '(vacuum/index maintenance and backups are managed on DBserver)')]
+
     logical = stats.get("logical_size_bytes")
     wal = stats.get("wal_size_bytes")
     freelist = stats.get("freelist_count")
@@ -2039,9 +2047,18 @@ def run_doctor(args):
             check_ok(f"Created {_DHH}/memories/")
             fixed_count += 1
     
-    # Check SQLite session store
+    # Select storage before looking for retained SQLite migration evidence.
     state_db_path = hermes_home / "state.db"
-    if state_db_path.exists():
+    from hermes_cli.session_postgres import collect_stats as _collect_pg_session_stats
+    _native_session_stats = _collect_pg_session_stats(state_db_path)
+    if _native_session_stats is not None:
+        for _kind, _text, _detail in _render_state_db_stats(_native_session_stats):
+            if _kind == 'warn':
+                check_warn(_text, _detail)
+                issues.append('Session PostgreSQL backend requires database operator attention')
+            else:
+                check_info(_text + (' ' + _detail if _detail else ''))
+    elif state_db_path.exists():
         try:
             import sqlite3
             conn = sqlite3.connect(str(state_db_path))
@@ -2172,7 +2189,7 @@ def run_doctor(args):
 
     # Check WAL file size (unbounded growth indicates missed checkpoints)
     wal_path = hermes_home / "state.db-wal"
-    if wal_path.exists():
+    if _native_session_stats is None and wal_path.exists():
         try:
             wal_size = wal_path.stat().st_size
             if wal_size > 50 * 1024 * 1024:  # 50 MB

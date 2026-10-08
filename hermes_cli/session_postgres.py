@@ -37,6 +37,51 @@ def connection_for(db_path=None, *, read_only=False, timeout=3):
     return None if settings is None else SessionConnection(settings, read_only=read_only, timeout=timeout)
 
 
+def collect_stats(db_path):
+    """Read-only native diagnostics, or None when SQLite is selected.
+
+    A configuration failure is an unavailable backend, never permission to
+    inspect/repair an old local file. No SQL/DSN payload is returned on failure.
+    This checks logical schema/readability, not physical backup integrity.
+    """
+    stats = {'backend': 'unavailable', 'healthy': False}
+    conn = None
+    try:
+        settings = configuration('sessions', db_path)
+        if settings is None:
+            return None
+        stats['backend'] = 'postgresql'
+        conn = SessionConnection(settings, read_only=True, timeout=2)
+        conn.validate_schema()
+        with conn:
+            if conn.execute("SELECT json_extract(?, ?)", ('{"_reset_from":"ok"}', '$._reset_from')).fetchone()[0] != 'ok':
+                raise ValueError('Native session functions unavailable')
+            stats['sessions'] = conn.execute('SELECT count(*) FROM sessions').fetchone()[0]
+            stats['messages'] = conn.execute('SELECT count(*) FROM messages').fetchone()[0]
+            stats['logical_size_bytes'] = conn.execute(
+                'SELECT coalesce(sum(pg_total_relation_size(c.oid)),0) '
+                'FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace '
+                "WHERE n.nspname=current_schema() AND c.relkind='r'"
+            ).fetchone()[0]
+            indexes = conn.execute(
+                'SELECT c.relname, i.indisvalid AND i.indisready '
+                'FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid '
+                'JOIN pg_namespace n ON n.oid=c.relnamespace '
+                'WHERE n.nspname=current_schema() AND c.relname IN (?,?,?)',
+                ('messages_content_trgm', 'messages_tool_name_trgm', 'messages_tool_calls_trgm'),
+            ).fetchall()
+            stats['search_indexes'] = {row[0]: bool(row[1]) for row in indexes}
+        stats['healthy'] = len(indexes) == 3 and all(row[1] for row in indexes)
+        if not stats['healthy']:
+            stats['error'] = 'SearchIndexesUnavailable'
+    except Exception as exc:
+        stats['error'] = type(exc).__name__
+    finally:
+        if conn is not None:
+            conn.close()
+    return stats
+
+
 def _bind_query(query, parameters):
     if not isinstance(parameters, Mapping):
         return _parameters(query), parameters
