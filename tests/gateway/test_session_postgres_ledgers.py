@@ -107,7 +107,7 @@ def test_readonly_is_enforced_by_database_even_for_cte(profile):
 def test_profile_does_not_fall_back_and_core_activation_is_blocked(profile):
     path, _ = profile
     from hermes_state import SessionDB
-    with pytest.raises(RuntimeError, match='awaits the transcript/search'):
+    with pytest.raises(RuntimeError, match='awaits final cutover readiness'):
         SessionDB(path)
     with pytest.raises(ValueError, match='override'):
         pg.connection_for(path.parent/'different.db')

@@ -20,6 +20,16 @@ from hermes_cli.session_postgres import SessionConnection, SessionAdmissionBusy
 class PostgresSessionDB(SessionDB):
     is_postgres = True
 
+    @classmethod
+    def _encode_content(cls, content):
+        from hermes_cli.session_content_codec import encode_legacy
+        return encode_legacy(super()._encode_content(content))
+
+    @classmethod
+    def _decode_content(cls, content):
+        from hermes_cli.session_content_codec import decode_legacy
+        return super()._decode_content(decode_legacy(content))
+
     def __init__(self, db_path: Path, read_only=False):
         self.db_path = Path(db_path)
         _ensure_test_isolation(self.db_path)
@@ -160,3 +170,11 @@ class PostgresSessionDB(SessionDB):
 
     def optimize_fts_storage(self, *args, **kwargs):
         raise RuntimeError('SQLite FTS storage conversion does not apply to PostgreSQL')
+
+    def purge_stale_tool_call_markers(self, *, dry_run=False, backup=True):
+        report = super().purge_stale_tool_call_markers(dry_run=True, backup=False)
+        if dry_run:
+            return report
+        if backup and report['rows_affected']:
+            raise RuntimeError('Create and verify a DBserver PostgreSQL backup before using backup=False for this maintenance operation')
+        return super().purge_stale_tool_call_markers(dry_run=False, backup=False)

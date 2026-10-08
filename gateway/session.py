@@ -16,6 +16,7 @@ import json
 import threading
 import uuid
 from pathlib import Path
+from gateway.session_db_recovery import RequiredSessionStoreUnavailable
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Any
@@ -1365,17 +1366,21 @@ class SessionStore:
         reach session storage.
 
         Handles are cached per resolved path, so a hot inbound path opens
-        SQLite once per profile rather than once per message, and two
+        storage once per profile rather than once per message, and two
         profiles never share a handle. Failed opens enter a bounded backoff;
         once it expires, one caller reopens while concurrent callers keep
-        using the JSONL fallback.
+        using the JSONL fallback for SQLite profiles only. A selected native
+        PostgreSQL profile fails closed, including cached failure/backoff.
         """
         from hermes_state import SessionDB, _default_db_path
 
         path = Path(db_path) if db_path is not None else Path(_default_db_path())
+        from gateway.session_db_recovery import session_store_scope, requires_postgres
+        required = requires_postgres(db_path)
         def _open():
             try:
-                return SessionDB(db_path=path) if db_path is not None else SessionDB()
+                with session_store_scope(db_path):
+                    return SessionDB(db_path=path) if db_path is not None else SessionDB()
             except RuntimeError as e:
                 if "live-system guard" in str(e):
                     # Test-isolation guard fired: a pytest-context process
@@ -1384,19 +1389,28 @@ class SessionStore:
                     # is a loud, hard failure.  Deliberately not cached: the
                     # guard must fire again on the next attempt.
                     raise
-                print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")
+                print(f"[gateway] Warning: session store unavailable ({type(e).__name__})")
                 raise
             except Exception as e:
-                print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")
+                print(f"[gateway] Warning: session store unavailable ({type(e).__name__})")
                 raise
 
-        return self._db_handle_cache.get(
-            path,
-            _open,
-            non_cacheable=lambda exc: (
-                isinstance(exc, RuntimeError) and "live-system guard" in str(exc)
-            ),
-        )
+        try:
+            handle = self._db_handle_cache.get(
+                path,
+                _open,
+                raise_on_error=required,
+                non_cacheable=lambda exc: (
+                    isinstance(exc, RuntimeError) and "live-system guard" in str(exc)
+                ),
+            )
+        except Exception:
+            if required:
+                raise RequiredSessionStoreUnavailable('PostgreSQL session storage unavailable; local fallback is disabled') from None
+            raise
+        if required and (handle is None or not getattr(handle, 'is_postgres', False)):
+            raise RequiredSessionStoreUnavailable('PostgreSQL session storage unavailable; local fallback is disabled')
+        return handle
 
     @property
     def _db(self):
@@ -1442,6 +1456,8 @@ class SessionStore:
             if home is None:
                 return self._db
             return self._open_session_db_for_active_scope(db_path=home / "state.db")
+        except RequiredSessionStoreUnavailable:
+            raise
         except AttributeError:
             # Bare test instances (object.__new__) lack _routing_home AND the
             # handle cache behind the _db property; behave like main's old
@@ -1544,6 +1560,8 @@ class SessionStore:
             return None
         try:
             return self._open_session_db_for_active_scope(db_path=home / "state.db")
+        except RequiredSessionStoreUnavailable:
+            raise
         except Exception:
             # Same contract as ``_db``: a failed open degrades to the JSONL
             # fallback rather than taking routing down.
@@ -1681,6 +1699,8 @@ class SessionStore:
                     db_had_entries = bool(self._entries)
                     db_load_succeeded = True
                 except Exception as e:
+                    if getattr(_db, 'is_postgres', False):
+                        raise RequiredSessionStoreUnavailable('PostgreSQL routing load failed; local fallback is disabled') from None
                     logger.warning(
                         "gateway.session: state.db routing load failed: %s", e
                     )
@@ -1689,7 +1709,7 @@ class SessionStore:
         # written by an older gateway after a downgrade). Only fills keys the
         # DB didn't provide — DB entries win.
         sessions_file = self.sessions_dir / "sessions.json"
-        if sessions_file.exists():
+        if sessions_file.exists() and not getattr(_db, "is_postgres", False):
             try:
                 with open(sessions_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -1886,6 +1906,8 @@ class SessionStore:
         try:
             durable = loader(scope=self._routing_scope())
         except Exception as exc:
+            if getattr(_db, 'is_postgres', False):
+                raise RequiredSessionStoreUnavailable('PostgreSQL routing reconciliation failed; local fallback is disabled') from None
             logger.warning(
                 "gateway.session: recovered state.db routing load failed: %s", exc
             )
@@ -1955,6 +1977,8 @@ class SessionStore:
                         )
                         db_saved = True
                     except Exception as exc:
+                        if getattr(_db, 'is_postgres', False):
+                            raise RequiredSessionStoreUnavailable('PostgreSQL routing save failed; local fallback is disabled') from None
                         logger.warning(
                             "gateway.session: state.db routing save failed: %s", exc
                         )
@@ -2124,6 +2148,8 @@ class SessionStore:
                     fast_persisted[session_key] = (revision, entry_json)
                 return
             except Exception as exc:
+                if getattr(_db, 'is_postgres', False):
+                    raise RequiredSessionStoreUnavailable('PostgreSQL routing entry save failed; automatic replay is disabled') from None
                 logger.warning(
                     "gateway.session: single-entry routing save failed for %r "
                     "(%s); falling back to full index rewrite",

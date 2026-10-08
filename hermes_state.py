@@ -4926,7 +4926,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # ledgers between PostgreSQL and the retained SQLite snapshot.
         from hermes_cli.postgres_runtime import configuration as storage_configuration
         if storage_configuration('sessions', self.db_path) is not None:
-            raise RuntimeError('PostgreSQL session activation awaits the transcript/search runtime migration')
+            raise RuntimeError('PostgreSQL session activation awaits final cutover readiness')
         self.read_only = read_only
 
         self._lock = threading.Lock()
@@ -13843,8 +13843,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
             if replacement is not None:
                 self._insert_message_rows(conn, session_id, [replacement])
-                inserted = conn.execute("SELECT last_insert_rowid()").fetchone()
-                replacement_message_id = int(inserted[0])
+                replacement_message_id = int(replacement['_row_id'])
             conn.execute(
                 "UPDATE sessions SET rewind_count = COALESCE(rewind_count, 0) + 1 "
                 "WHERE id = ?",

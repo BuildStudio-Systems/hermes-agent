@@ -164,9 +164,21 @@ def import_snapshot(settings, path):
                     sql.Identifier(table), selection,
                     sql.SQL(',').join(sql.Placeholder() for _ in columns))
                 old_hashes = []
+                content_column = columns.index('content') if table == 'messages' else None
                 cursor = source.execute('SELECT '+','.join(map(_quote, columns))+' FROM '+_quote(table))
                 with target.cursor() as writer:
                     while batch := cursor.fetchmany(250):
+                        if content_column is not None:
+                            from hermes_cli.session_content_codec import encode_legacy, decode_legacy
+                            encoded_batch = []
+                            for row in batch:
+                                values = list(row)
+                                original = values[content_column]
+                                values[content_column] = encode_legacy(original)
+                                if decode_legacy(values[content_column]) != original:
+                                    raise ValueError('Message content encoding is not reversible')
+                                encoded_batch.append(values)
+                            batch = encoded_batch
                         old_hashes.extend(_row_hash(row) for row in batch)
                         writer.executemany(insert, batch)
                 # Server cursor bounds verification memory for large tool outputs.
@@ -190,4 +202,5 @@ def import_snapshot(settings, path):
             # setval is NOT transactional; ALTER IDENTITY rolls back with rows.
             target.execute(sql.SQL('ALTER TABLE messages ALTER COLUMN id RESTART WITH {}').format(sql.Literal(next_id)))
     return {'schema':schema, 'verified':True, 'tables':receipts,
+            'message_content_encoding':'hermes-pg-content-v1',
             'empty_optional_tables':sorted(set(TABLES)-set(inventory)), 'next_message_id':next_id}

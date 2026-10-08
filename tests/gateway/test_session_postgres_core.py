@@ -157,6 +157,159 @@ def test_native_diagnostics_missing_index_fails_without_exposing_sql(database):
         credentials.write_text(saved)
 
 
+def test_gateway_handles_use_native_backend_and_restore_background_scope(database, monkeypatch, tmp_path):
+    import hermes_state
+    from hermes_constants import get_hermes_home, set_hermes_home_override, reset_hermes_home_override
+    from gateway.session import SessionStore
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    import threading
+    monkeypatch.setattr(hermes_state, 'DEFAULT_DB_PATH', hermes_state._IMPORT_DEFAULT_DB_PATH)
+    # Ordinary factory activation is still gated; exercise the exact consumer
+    # path using the already tested native constructor in isolation.
+    monkeypatch.setattr(hermes_state, 'SessionDB', lambda db_path=None, **kw:
+                        PostgresSessionDB(db_path or get_hermes_home()/'state.db', **kw))
+    store = SessionStore(database.db_path.parent/'sessions', GatewayConfig())
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._session_db_handles = {}
+    runner._session_db_handles_lock = threading.Lock()
+    try:
+        assert store._db.is_postgres
+        wrapped = runner._open_session_db_for_active_scope()
+        assert wrapped._db is store._db
+        other = tmp_path/'background'
+        other.mkdir()
+        token = set_hermes_home_override(other)
+        try:
+            native = store._open_session_db_for_active_scope(database.db_path)
+            native.create_session('background-native', source='api')
+            assert get_hermes_home() == other
+        finally:
+            reset_hermes_home_override(token)
+        assert database.get_session('background-native')
+        assert not (other/'state.db').exists()
+    finally:
+        runner.close_all_session_db_handles()
+        store.close_all_db_handles()
+
+
+def test_gateway_pg_failure_and_cached_local_handle_never_allow_fallback(profile, monkeypatch):
+    import hermes_state
+    import threading
+    from gateway.session import SessionStore
+    from gateway.session_db_recovery import RecoverableHandleCache
+    from gateway.run import GatewayRunner
+    path, _ = profile
+    monkeypatch.setattr(hermes_state, 'DEFAULT_DB_PATH', hermes_state._IMPORT_DEFAULT_DB_PATH)
+    calls = []
+    def fail(*a, **kw):
+        calls.append(1)
+        raise OSError('secret DSN and database error payload')
+    monkeypatch.setattr(hermes_state, 'SessionDB', fail)
+    store = object.__new__(SessionStore)
+    store._db_handle_cache = RecoverableHandleCache()
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match='local fallback is disabled') as error:
+            store._open_session_db_for_active_scope()
+        assert 'secret' not in str(error.value)
+    assert len(calls) == 1, 'backoff still prevents repeated database connection attempts'
+    store._db_handle_cache.handles[path] = object()  # stale SQLite handle after config change
+    with pytest.raises(RuntimeError, match='local fallback is disabled'):
+        store._open_session_db_for_active_scope()
+    store._routing_home = path.parent
+    with pytest.raises(RuntimeError, match='local fallback is disabled'):
+        store._routing_db
+    monkeypatch.setattr(store, '_named_profile_for_key', lambda key: 'target')
+    monkeypatch.setattr(store, '_profile_home_for_key', lambda key: path.parent)
+    with pytest.raises(RuntimeError, match='local fallback is disabled'):
+        store._db_for_key('agent:target:api:owner')
+    runner = object.__new__(GatewayRunner)
+    runner._session_db_handles = {}
+    runner._session_db_handles_lock = threading.Lock()
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match='local fallback is disabled'):
+            runner._open_session_db_for_active_scope()
+
+
+def test_gateway_native_routing_never_imports_or_falls_back_to_json(database, monkeypatch, tmp_path):
+    import hermes_state
+    from gateway.session import SessionStore, SessionEntry
+    from gateway.config import GatewayConfig
+    from datetime import datetime, timezone
+    monkeypatch.setattr(hermes_state, 'DEFAULT_DB_PATH', hermes_state._IMPORT_DEFAULT_DB_PATH)
+    monkeypatch.setattr(hermes_state, 'SessionDB', lambda **kw: database)
+    directory = tmp_path/'sessions'
+    directory.mkdir()
+    entry = SessionEntry(session_key='legacy-key', session_id='legacy',
+                         created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc))
+    mirror = directory/'sessions.json'
+    mirror.write_text(json.dumps({'legacy-key':entry.to_dict()}))
+    initial = mirror.read_bytes()
+    store = SessionStore(directory, GatewayConfig())
+    store._ensure_loaded()
+    assert not store._entries, 'retained local routing must not override native database'
+    def fail(*a, **kw):
+        raise OSError('private diagnostic payload')
+    monkeypatch.setattr(database, 'load_gateway_routing_entries', fail)
+    store._loaded = False
+    with pytest.raises(RuntimeError, match='local fallback is disabled'):
+        store._ensure_loaded()
+    monkeypatch.setattr(database, 'replace_gateway_routing_entries', fail)
+    with pytest.raises(RuntimeError, match='local fallback is disabled'):
+        store._persist_routing_data({'new-key':entry.to_dict()}, 10)
+    assert mirror.read_bytes() == initial
+
+
+_rewind_spec = importlib.util.spec_from_file_location('native_rewind_contracts', Path(__file__).resolve().parents[1]/'hermes_state/test_composite_carrier_rewind.py')
+_rewind_contracts = importlib.util.module_from_spec(_rewind_spec)
+_rewind_spec.loader.exec_module(_rewind_contracts)
+
+
+@pytest.mark.parametrize('name', [name for name in vars(_rewind_contracts) if name.startswith('test_')])
+def test_native_composite_rewind_contracts(database, monkeypatch, name):
+    monkeypatch.setattr(_rewind_contracts, 'SessionDB', PostgresSessionDB)
+    getattr(_rewind_contracts, name)(database)
+
+
+@pytest.mark.parametrize('content', [
+    [{'type':'text', 'text':'图片说明 日本語'}, {'type':'image_url', 'image_url':{'url':'data:image/png;base64,AA=='}}],
+    {'type':'text', 'text':'nested\0text'},
+    'plain\0text 中文',
+    '\x1ehermes-pg-content-v1:literal text',
+    '\x1ehermes-pg-content-v1:["text","literal encoded-looking user input"]',
+    b'raw\0bytes',
+])
+def test_native_content_codec_is_lossless_across_replace_export_import(database, content, tmp_path):
+    from hermes_state import SessionDB
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    legacy_home = tmp_path/'legacy-content'
+    token = set_hermes_home_override(legacy_home)
+    try:
+        with SessionDB(legacy_home/'state.db') as legacy:
+            legacy.create_session('legacy', source='api')
+            legacy.append_message('legacy', role='user', content=content)
+            legacy_replay = legacy.get_messages_as_conversation('legacy')[0]['content']
+    finally:
+        reset_hermes_home_override(token)
+    db = database
+    db.create_session('content', source='api')
+    db.append_message('content', role='user', content=content)
+    assert db.get_messages('content')[0]['content'] == content
+    assert db.get_messages_as_conversation('content')[0]['content'] == legacy_replay
+    exported = db.export_session('content')
+    assert exported['messages'][0]['content'] == content
+    db.replace_messages('content', exported['messages'])
+    assert db.get_messages('content')[0]['content'] == content
+    if isinstance(content, bytes):
+        # Legacy JSON import explicitly rejects binary payloads; database
+        # snapshots and direct replace/read retain the original bytes.
+        return
+    db.delete_session('content')
+    db.import_sessions([exported])
+    assert db.get_messages('content')[0]['content'] == content
+
+
 def test_batch_replace_export_and_import(database):
     db = database
     db.create_session('session',source='api',user_id='owner')

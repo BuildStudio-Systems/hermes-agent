@@ -223,3 +223,16 @@ def test_identity_exhaustion_rolls_back_everything(source, target):
 def test_unsafe_settings_refused(source, target, change):
     with pytest.raises(ValueError):
         import_snapshot({**target,**change}, source)
+
+
+@pytest.mark.parametrize('value', ['\0json:[{"type":"text","text":"image caption"}]', 'plain\0text', '\x1ehermes-pg-content-v1:literal', b'raw\0bytes'])
+def test_multimodal_and_special_content_migrates_reversibly(source, target, value):
+    from hermes_cli.session_content_codec import decode_legacy
+    with closing(sqlite3.connect(source)) as db, db:
+        db.execute('UPDATE messages SET content=? WHERE id=(SELECT min(id) FROM messages)', (value,))
+    receipt = import_snapshot(target, source)
+    assert receipt['message_content_encoding'] == 'hermes-pg-content-v1'
+    with connect(target) as db:
+        stored = db.execute('SELECT content FROM messages ORDER BY id LIMIT 1').fetchone()[0]
+    assert '\0' not in stored
+    assert decode_legacy(stored) == value

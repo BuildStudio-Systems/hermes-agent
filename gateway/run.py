@@ -7867,6 +7867,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from gateway.session_db_recovery import RecoverableHandleCache
 
         path = Path(_default_db_path())
+        from gateway.session_db_recovery import requires_postgres, RequiredSessionStoreUnavailable
+        required = requires_postgres()
         cache = getattr(self, "_session_db_handle_cache", None)
         if cache is None:
             # Compatibility for lightweight test runners built with
@@ -7903,23 +7905,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # or backoff). Opening our own here would resurrect exactly
                 # the duplicate this borrows away from, so report the same
                 # unavailability the store is already reporting.
-                raise RuntimeError("SessionStore SQLite handle unavailable")
+                raise RuntimeError("SessionStore database handle unavailable")
             try:
                 return AsyncSessionDB(SessionDB())
             except Exception as exc:
-                logger.warning("SQLite session store not available: %s", exc)
+                logger.warning("Session store not available (%s)", type(exc).__name__)
                 raise
 
         def _recovered() -> None:
             self._session_db_init_error = None
-            logger.info("SQLite session store recovered")
+            logger.info("Session store recovered")
 
-        return cache.get(
-            path,
-            _open,
-            raise_on_error=raise_on_error,
-            on_recovered=_recovered,
-        )
+        try:
+            handle = cache.get(
+                path,
+                _open,
+                raise_on_error=raise_on_error or required,
+                on_recovered=_recovered,
+            )
+        except Exception:
+            if required:
+                raise RequiredSessionStoreUnavailable('PostgreSQL session storage unavailable; local fallback is disabled') from None
+            raise
+        if required and (handle is None or not getattr(handle, 'is_postgres', False)):
+            raise RequiredSessionStoreUnavailable('PostgreSQL session storage unavailable; local fallback is disabled')
+        return handle
 
     @property
     def _session_db(self) -> Any:

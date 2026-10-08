@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 import weakref
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -12,6 +13,38 @@ from typing import Any, Callable
 
 _INITIAL_RETRY_DELAY_SECONDS = 1.0
 _MAX_RETRY_DELAY_SECONDS = 60.0
+
+
+class RequiredSessionStoreUnavailable(RuntimeError):
+    """Selected central persistence must never degrade to a local store."""
+
+
+def requires_postgres(db_path=None):
+    from hermes_cli.postgres_runtime import configuration
+    try:
+        with session_store_scope(db_path):
+            return configuration('sessions', db_path) is not None
+    except Exception:
+        raise RequiredSessionStoreUnavailable('Session backend configuration unavailable; local fallback is disabled') from None
+
+
+@contextmanager
+def session_store_scope(db_path=None):
+    """Resolve an already-authorized internal store path in its owning home.
+
+    Background routing supplies explicit profile paths without a chat scope.
+    The override is context-local and only lasts while selecting/opening storage.
+    This function performs no authorization; callers must retain routing checks.
+    """
+    if db_path is None:
+        yield
+        return
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    token = set_hermes_home_override(Path(db_path).resolve().parent)
+    try:
+        yield
+    finally:
+        reset_hermes_home_override(token)
 
 
 @dataclass
