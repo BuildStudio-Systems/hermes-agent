@@ -213,3 +213,27 @@ This is not production activation. The ordinary SessionDB constructor still
 rejects sessions selection until backup/restore, remaining direct consumers and
 final cutover acceptance are complete. Running release remains
 20261008-cron-postgres; final numbered Word/PDF publication is pending.
+
+
+## File archive and recovery boundaries (source only, 2026-10-08)
+
+Quick snapshots, manual ZIPs and automatic pre-update/pre-migration ZIPs now
+exclude retained SQLite files/sidecars for selected PostgreSQL stores, including
+per-board kanban files and nested registered profile stores. An explicit manifest
+states that PostgreSQL data is NOT included: these are local configuration/file
+archives and require the independent DBserver backup chain for database recovery.
+No backup success, timestamp or pairing is invented by this manifest.
+
+Restore preserves live PostgreSQL configuration, credential mapping and managed
+store files. Local non-database files remain restorable. Archives carrying external
+storage metadata require every corresponding target profile/store to be provisioned
+before extraction. Older complete recovery archives are not pruned by newly created
+file-only snapshots. Configuration failure refuses backup rather than falling back.
+
+Canonical archive regression: **82 passed, 0 failed**, five files (nine new boundary
+cases). Includes manual/automatic ZIPs, quick restore, older recovery preservation,
+unprovisioned target refusal, configuration failure and existing archive stability.
+An existing EOF test used a scalar instead of valid YAML profile config; corrected
+the fixture so the test continues to exercise the EOF confirmation path.
+These changes are not deployed and do not replace the final stopped-writer DBserver
+backup/import/restore/role acceptance required before production session activation.

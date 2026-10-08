@@ -36,6 +36,7 @@ from utils import (
 # Shared formatter; the private alias is kept because claw.py and the backup
 # tests import ``_format_size`` from this module.
 from hermes_cli.sizefmt import format_bytes as _format_size
+from hermes_cli.postgres_backup_boundary import BackupBoundary, MANIFEST as PG_MANIFEST, NOTICE as PG_BACKUP_NOTICE
 
 logger = logging.getLogger(__name__)
 
@@ -804,10 +805,17 @@ def run_backup(args) -> None:
     except BackupInProgressError as exc:
         print(f"Error: {exc}")
         raise SystemExit(2) from exc
+    except RuntimeError as exc:
+        print(f"Error: {exc}")
+        raise SystemExit(1) from None
 
 
 def _run_backup_locked(args, hermes_root: Path) -> None:
     """Write a full backup while the cross-process backup slot is held."""
+
+    boundary = BackupBoundary(hermes_root)
+    if boundary.profiles:
+        print(PG_BACKUP_NOTICE)
 
     # Determine output path
     out_path = None
@@ -862,7 +870,7 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
             fpath = dp / fname
             rel = fpath.relative_to(hermes_root)
 
-            if _should_skip_backup_file(fpath, rel, out_path):
+            if boundary.excluded(rel) or _should_skip_backup_file(fpath, rel, out_path):
                 continue
 
             files_to_add.append((fpath, rel))
@@ -916,6 +924,8 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
     with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
         archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6
     ) as zf:
+        if boundary.profiles:
+            zf.writestr(PG_MANIFEST, json.dumps(boundary.manifest(), ensure_ascii=False))
         for i, (abs_path, rel_path) in enumerate(files_to_add, 1):
             try:
                 # Safe copy for SQLite databases (handles WAL mode)
@@ -1011,7 +1021,9 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
             print(f"  ... and {len(errors) - 10} more")
 
     if not errors:
-        print(f"\nRestore with: hermes import {out_path.name}")
+        print(f"\nRestore files with: hermes import {out_path.name}")
+        if boundary.profiles:
+            print(PG_BACKUP_NOTICE)
 
 
 # ---------------------------------------------------------------------------
@@ -1206,6 +1218,13 @@ def run_import(args) -> None:
         sys.exit(1)
 
     hermes_root = get_default_hermes_root()
+    try:
+        boundary = BackupBoundary(hermes_root)
+    except RuntimeError as exc:
+        print(f"Error: {exc}")
+        raise SystemExit(1) from None
+    if boundary.profiles:
+        print(PG_BACKUP_NOTICE)
 
     with zipfile.ZipFile(zip_path, "r") as zf:
         # Validate
@@ -1215,6 +1234,11 @@ def run_import(args) -> None:
             sys.exit(1)
 
         prefix = _detect_prefix(zf)
+        for marker in set((prefix + PG_MANIFEST, PG_MANIFEST)) & set(zf.namelist()):
+            # Bound untrusted manifest size before decompression/parsing.
+            if zf.getinfo(marker).file_size > 65536 or not boundary.accepts_manifest(json.loads(zf.read(marker))):
+                print('Error: provision every PostgreSQL profile before restoring this file archive.')
+                raise SystemExit(1)
         members = [n for n in zf.namelist() if not n.endswith("/")]
         file_count = len(members)
 
@@ -1272,6 +1296,13 @@ def run_import(args) -> None:
                     errors.append(f"  {member}: path traversal blocked")
                     continue
                 try:
+                    local_relative = target.resolve().relative_to(hermes_root.resolve())
+                except ValueError:
+                    local_relative = None
+                if local_relative is not None and boundary.protected_restore(local_relative):
+                    skipped_runtime.append(member)
+                    continue
+                try:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     _extract_member_atomically(zf, member, target, new_file_mode)
                     # External provider configs commonly hold credentials.
@@ -1295,6 +1326,9 @@ def run_import(args) -> None:
                 rel = member
 
             if not rel:
+                continue
+            if boundary.protected_restore(rel):
+                skipped_runtime.append(rel)
                 continue
 
             # Never overwrite volatile gateway/process runtime state. These are
@@ -1526,6 +1560,9 @@ def _create_quick_snapshot_locked(
     """
     home = hermes_home or get_hermes_home()
     root = _quick_snapshot_root(home)
+    boundary = BackupBoundary(home)
+    if boundary.profiles:
+        print(PG_BACKUP_NOTICE)
 
     def _too_large(path: Path, rel_name: str) -> bool:
         """True (and warn) when ``path`` exceeds the max_file_size cap."""
@@ -1571,6 +1608,8 @@ def _create_quick_snapshot_locked(
     oversized_skipped: list[str] = []
 
     for rel in _QUICK_STATE_FILES:
+        if boundary.excluded(rel):
+            continue
         src = home / rel
         if not src.exists():
             continue
@@ -1583,6 +1622,8 @@ def _create_quick_snapshot_locked(
                 if not sub.is_file():
                     continue
                 sub_rel = sub.relative_to(home).as_posix()
+                if boundary.excluded(sub_rel):
+                    continue
                 # Skip heavy, regenerable per-board subtrees (scratch
                 # workspaces and task attachments can be large); we only need
                 # the board databases + their metadata to restore a board.
@@ -1686,6 +1727,7 @@ def _create_quick_snapshot_locked(
         "files": manifest,
         "failed_dbs": failed_dbs,
         "oversized_skipped": oversized_skipped,
+        "external_storage": boundary.manifest() if boundary.profiles else None,
     }
     with open(staging_dir / "manifest.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -1698,7 +1740,7 @@ def _create_quick_snapshot_locked(
     # #68805 review: skip pruning when a present DB failed to capture OR was
     # skipped for size — either way the snapshot is incomplete and the older
     # snapshot may contain the only recoverable database.
-    incomplete = failed_dbs or oversized_skipped
+    incomplete = failed_dbs or oversized_skipped or boundary.profiles
     if not incomplete:
         _prune_quick_snapshots(root, keep=_QUICK_DEFAULT_KEEP if keep is None else keep)
     else:
@@ -1764,6 +1806,9 @@ def restore_quick_snapshot(
     """
     home = hermes_home or get_hermes_home()
     root = _quick_snapshot_root(home)
+    boundary = BackupBoundary(home)
+    if boundary.profiles:
+        print(PG_BACKUP_NOTICE)
 
     # Security: reject snapshot_id values that contain path separators or
     # traversal sequences so that `root / snapshot_id` stays inside root.
@@ -1790,8 +1835,14 @@ def restore_quick_snapshot(
     with open(manifest_path, encoding="utf-8") as f:
         meta = json.load(f)
 
+    if meta.get('external_storage') and not boundary.accepts_manifest(meta['external_storage']):
+        logger.error('PostgreSQL profile must be provisioned before restoring its file snapshot')
+        return False
     restored = 0
     for rel in meta.get("files", {}):
+        if boundary.protected_restore(rel):
+            logger.warning('Preserved PostgreSQL-managed file during restore: %s', rel)
+            continue
         # Security: reject absolute paths and traversals in manifest entries
         src = snap_dir / rel
         try:
@@ -2107,6 +2158,13 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
     Returns the output path on success, None on failure (nothing to back up,
     or write error — caller should surface the outcome but not raise).
     """
+    try:
+        boundary = BackupBoundary(hermes_root)
+    except RuntimeError as exc:
+        logger.warning('%s', exc)
+        return None
+    if boundary.profiles:
+        logger.warning(PG_BACKUP_NOTICE)
     scan_started = time.monotonic()
     logger.info("automatic backup phase=scan status=started")
     files_to_add: list[tuple[Path, Path]] = []
@@ -2123,7 +2181,7 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
                 except ValueError:
                     continue
 
-                if _should_skip_backup_file(fpath, rel, out_path):
+                if boundary.excluded(rel) or _should_skip_backup_file(fpath, rel, out_path):
                     continue
 
                 files_to_add.append((fpath, rel))
@@ -2145,6 +2203,8 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
         with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
             archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6
         ) as zf:
+            if boundary.profiles:
+                zf.writestr(PG_MANIFEST, json.dumps(boundary.manifest(), ensure_ascii=False))
             for index, (abs_path, rel_path) in enumerate(files_to_add, 1):
                 try:
                     if abs_path.suffix == ".db":
@@ -2277,7 +2337,13 @@ def create_pre_update_backup(
     if result is None:
         return None
 
-    _prune_pre_update_backups(backup_dir, keep=keep)
+    try:
+        if not BackupBoundary(hermes_root).profiles:
+            _prune_pre_update_backups(backup_dir, keep=keep)
+        else:
+            logger.warning('Preserving earlier database recovery archives; new archive covers local files only')
+    except RuntimeError:
+        logger.warning('Preserving recovery archives: database selection could not be verified')
     return out_path
 
 
@@ -2354,5 +2420,11 @@ def create_pre_migration_backup(
     if result is None:
         return None
 
-    _prune_pre_migration_backups(backup_dir, keep=keep)
+    try:
+        if not BackupBoundary(hermes_root).profiles:
+            _prune_pre_migration_backups(backup_dir, keep=keep)
+        else:
+            logger.warning('Preserving earlier database recovery archives; new archive covers local files only')
+    except RuntimeError:
+        logger.warning('Preserving recovery archives: database selection could not be verified')
     return out_path

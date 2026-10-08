@@ -656,7 +656,7 @@ class TestImportEdgeCases:
         """Import handles EOFError during confirmation prompt."""
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
-        (hermes_home / "config.yaml").write_text("existing\n")
+        (hermes_home / "config.yaml").write_text("model: existing\n")
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
@@ -1850,7 +1850,6 @@ class TestMemoryProviderExternalPaths:
         assert (restored.stat().st_mode & 0o777) == 0o600
         # External state did NOT leak into HERMES_HOME.
         assert not (hermes_home / "_external").exists()
-
 
 
 
