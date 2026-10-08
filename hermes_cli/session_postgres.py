@@ -10,6 +10,8 @@ import atexit
 import hashlib
 import json
 import os
+import re
+from collections.abc import Mapping
 import threading
 from collections import deque
 
@@ -33,6 +35,32 @@ atexit.register(close_pools)
 def connection_for(db_path=None, *, read_only=False, timeout=3):
     settings = configuration('sessions', db_path)
     return None if settings is None else SessionConnection(settings, read_only=read_only, timeout=timeout)
+
+
+def _bind_query(query, parameters):
+    if not isinstance(parameters, Mapping):
+        return _parameters(query), parameters
+    # Named bindings occur in the import path. Preserve literals, quoted
+    # identifiers, comments and PostgreSQL :: casts; only replace :names.
+    values = []
+    token = re.compile(r"('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|--[^\n]*|/\*.*?\*/|::)|:([A-Za-z_][A-Za-z_0-9]*)", re.S)
+    def bind(match):
+        if match.group(1) is not None:
+            return match.group(1).replace('%', '%%')
+        values.append(parameters[match.group(2)])
+        return '%s'
+    pieces=[]
+    position=0
+    for match in token.finditer(query):
+        pieces.append(query[position:match.start()].replace('%','%%'))
+        pieces.append(bind(match))
+        position=match.end()
+    pieces.append(query[position:].replace('%','%%'))
+    return ''.join(pieces), values
+
+
+class SessionAdmissionBusy(TimeoutError):
+    """No business SQL ran: bounded pool/transaction admission was busy."""
 
 
 class Cursor:
@@ -61,9 +89,8 @@ class Cursor:
 class SessionConnection:
     is_postgres = True
 
-    def __init__(self, settings, *, read_only=False, timeout=3):
+    def __init__(self, settings, *, read_only=False, timeout=3, autocommit=False):
         from psycopg_pool import ConnectionPool
-        import re
 
         self.schema = settings['schema']
         if not re.fullmatch(r'agent_[a-z0-9_]{1,48}', self.schema):
@@ -84,6 +111,7 @@ class SessionConnection:
                 _pools[identity] = pool
         self._pool = pool
         self.read_only = read_only
+        self.autocommit = autocommit
         self._timeout = max(0.01, min(float(timeout), 3.0))
         self._db = None
         self._closed = False
@@ -107,9 +135,14 @@ class SessionConnection:
         readonly = self.read_only if read_only is None else read_only
         if self.read_only and not readonly:
             raise RuntimeError('Session database is read-only')
-        self._db = self._pool.getconn(timeout=self._timeout)
+        from psycopg_pool import PoolTimeout
+        from psycopg.errors import LockNotAvailable, QueryCanceled
         try:
-            self._db.execute('BEGIN READ ONLY' if readonly else 'BEGIN')
+            self._db = self._pool.getconn(timeout=self._timeout)
+        except PoolTimeout as exc:
+            raise SessionAdmissionBusy('Session PostgreSQL connection pool is busy') from exc
+        try:
+            self._db.execute('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY' if readonly else 'BEGIN')
             self._db.execute(sql.SQL('SET LOCAL search_path TO {}, pg_catalog').format(
                 sql.Identifier(self.schema)))
             self._db.execute("SELECT set_config('statement_timeout', %s, true)",
@@ -120,26 +153,32 @@ class SessionConnection:
                 # Shared across core/rooms/delivery/delegation, like the old
                 # file write lock. Reads never wait on this advisory lock.
                 self._db.execute('SELECT pg_advisory_xact_lock(%s)', (self._write_lock,))
+        except (LockNotAvailable, QueryCanceled) as exc:
+            self.rollback()
+            raise SessionAdmissionBusy('Session PostgreSQL write admission is busy') from exc
         except BaseException:
             self.rollback()
             raise
 
     def execute(self, query, parameters=None):
         # No SQL rewrite, implicit PRAGMA emulation, DDL or RETURNING guessing.
-        # Non-SELECT callers must explicitly commit, as with SQLite DML.
+        # Auxiliary DML retains explicit transactions; core handles opt into
+        # standalone autocommit while business units still use with-transaction.
         standalone_read = self._db is None and query.lstrip().split(None, 1)[0].upper() == 'SELECT'
+        standalone = self._db is None and (standalone_read or self.autocommit)
         self._begin(read_only=True if standalone_read else None)
         try:
             with self._db.cursor() as cursor:
-                cursor.execute(query if parameters is None else _parameters(query), parameters)
+                bound, values = (query, None) if parameters is None else _bind_query(query, parameters)
+                cursor.execute(bound, values)
                 result = Cursor(cursor.fetchall() if cursor.description else (),
                                 rowcount=cursor.rowcount, description=cursor.description)
-            if standalone_read:
+            if standalone:
                 self.commit()
             return result
         except BaseException:
             self._failed = True
-            if standalone_read:
+            if standalone:
                 self.rollback()
             raise
 

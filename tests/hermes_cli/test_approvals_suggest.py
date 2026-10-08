@@ -149,13 +149,19 @@ class TestScan:
 # ---------------------------------------------------------------------------
 
 class TestNormalizeAndGlob:
-    def test_normalize_folds_home_prefix(self):
+    @pytest.mark.parametrize('home,folds', [('/home/approval-user',True),('/root',False)])
+    def test_normalize_folds_home_prefix(self, monkeypatch, home, folds):
         import os
 
-        home = os.path.expanduser("~")
+        expanduser = os.path.expanduser
+        monkeypatch.setattr(os.path, "expanduser", lambda path: home if path == "~" else expanduser(path))
         normalized = normalize_command(f"git checkout -- {home}/project/file.txt")
-        assert "~/project/file.txt" in normalized
-        assert home not in normalized
+        if folds:
+            assert "~/project/file.txt" in normalized
+            assert home not in normalized
+        else:
+            # The established degenerate-prefix guard intentionally rejects /root.
+            assert normalized == f"git checkout -- {home}/project/file.txt"
 
     def test_derive_glob_uses_first_two_tokens(self):
         assert derive_glob("git push --force origin main") == "git push *"

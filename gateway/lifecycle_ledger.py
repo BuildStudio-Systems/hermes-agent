@@ -244,6 +244,19 @@ def check_state_db_integrity(home: Optional[Path] = None) -> str:
     """
     base = home if home is not None else _process_hermes_home()
     path = base.joinpath(*_STATE_DB_RELATIVE)
+    try:
+        from hermes_cli.session_postgres import connection_for
+        native = connection_for(path, read_only=True, timeout=1)
+        if native is not None:
+            try:
+                native.validate_schema()
+            finally:
+                native.close()
+            # This proves schema reachability, not PostgreSQL page integrity.
+            # Physical integrity and recovery belong to the DBserver checks.
+            return "postgresql-schema-ok"
+    except Exception as exc:
+        return f"check-failed: {type(exc).__name__}"
     if not path.exists():
         return "absent"
     try:
@@ -278,7 +291,7 @@ def record_startup(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
             # corruption into a startup warning.
             verdict = check_state_db_integrity(home=home)
             evidence["state_db_integrity"] = verdict
-            if verdict not in ("ok", "absent"):
+            if verdict not in ("ok", "absent", "postgresql-schema-ok"):
                 logger.error(
                     "state.db FAILED integrity check after an unclean gateway "
                     "exit: %s — sessions may read as missing until it is "

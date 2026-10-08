@@ -4865,7 +4865,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return None
         prompt_hash = _system_prompt_hash(system_prompt)
         conn.execute(
-            "INSERT OR IGNORE INTO system_prompts (hash, prompt) VALUES (?, ?)",
+            "INSERT INTO system_prompts (hash, prompt) VALUES (?, ?) ON CONFLICT(hash) DO NOTHING",
             (prompt_hash, system_prompt),
         )
         return prompt_hash
@@ -8514,9 +8514,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # Then: try to insert. INSERT OR IGNORE returns no rowcount
             # difference — verify ownership via SELECT.
             conn.execute(
-                "INSERT OR IGNORE INTO compression_locks "
+                "INSERT INTO compression_locks "
                 "(session_id, holder, acquired_at, expires_at) "
-                "VALUES (?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?) ON CONFLICT(session_id) DO NOTHING",
                 (session_id, holder, now, expires_at),
             )
             row = conn.execute(
@@ -8664,9 +8664,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         (conversation_id, current_holder),
                     )
             conn.execute(
-                "INSERT OR IGNORE INTO session_turn_leases "
+                "INSERT INTO session_turn_leases "
                 "(conversation_id, holder, acquired_at, expires_at) "
-                "VALUES (?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?) ON CONFLICT(conversation_id) DO NOTHING",
                 (conversation_id, holder, now, expires_at),
             )
             owner = conn.execute(
@@ -9589,7 +9589,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    reasoning_tokens = ?,
                    estimated_cost_usd = COALESCE(?, 0),
                    actual_cost_usd = CASE
-                       WHEN ? IS NULL THEN actual_cost_usd
+                       WHEN CAST(? AS DOUBLE PRECISION) IS NULL THEN actual_cost_usd
                        ELSE ?
                    END,
                    cost_status = COALESCE(?, cost_status),
@@ -9610,7 +9610,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    reasoning_tokens = reasoning_tokens + ?,
                    estimated_cost_usd = COALESCE(estimated_cost_usd, 0) + COALESCE(?, 0),
                    actual_cost_usd = CASE
-                       WHEN ? IS NULL THEN actual_cost_usd
+                       WHEN CAST(? AS DOUBLE PRECISION) IS NULL THEN actual_cost_usd
                        ELSE COALESCE(actual_cost_usd, 0) + ?
                    END,
                    cost_status = COALESCE(?, cost_status),
@@ -9784,16 +9784,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(session_id, model, billing_provider, billing_base_url, billing_mode, task)
                DO UPDATE SET
-                   api_call_count = api_call_count + excluded.api_call_count,
-                   input_tokens = input_tokens + excluded.input_tokens,
-                   output_tokens = output_tokens + excluded.output_tokens,
-                   cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
-                   cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
-                   reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
-                   estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
-                   actual_cost_usd = actual_cost_usd + excluded.actual_cost_usd,
-                   cost_status = COALESCE(excluded.cost_status, cost_status),
-                   cost_source = COALESCE(excluded.cost_source, cost_source),
+                   api_call_count = session_model_usage.api_call_count + excluded.api_call_count,
+                   input_tokens = session_model_usage.input_tokens + excluded.input_tokens,
+                   output_tokens = session_model_usage.output_tokens + excluded.output_tokens,
+                   cache_read_tokens = session_model_usage.cache_read_tokens + excluded.cache_read_tokens,
+                   cache_write_tokens = session_model_usage.cache_write_tokens + excluded.cache_write_tokens,
+                   reasoning_tokens = session_model_usage.reasoning_tokens + excluded.reasoning_tokens,
+                   estimated_cost_usd = session_model_usage.estimated_cost_usd + excluded.estimated_cost_usd,
+                   actual_cost_usd = session_model_usage.actual_cost_usd + excluded.actual_cost_usd,
+                   cost_status = COALESCE(excluded.cost_status, session_model_usage.cost_status),
+                   cost_source = COALESCE(excluded.cost_source, session_model_usage.cost_source),
                    last_seen = excluded.last_seen""",
             (
                 session_id,
@@ -10471,7 +10471,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # and here loses instead of being silently overwritten.
             cursor = conn.execute(
                 "UPDATE sessions SET title = ?, title_source = ? "
-                "WHERE id = ? AND title IS ? AND title_source IS ?",
+                "WHERE id = ? AND title IS NOT DISTINCT FROM ? AND title_source IS NOT DISTINCT FROM ?",
                 (
                     title,
                     source if title else None,
@@ -11833,7 +11833,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id""",
                 (
                     session_id,
                     role,
@@ -11859,7 +11859,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     display_metadata_json,
                 ),
             )
-            msg_id = cursor.lastrowid
+            msg_id = cursor.fetchone()[0]
 
             # Update counters
             if num_tool_calls > 0:
@@ -12278,7 +12278,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id""",
                 (
                     session_id,
                     role,
@@ -12304,8 +12304,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._encode_display_metadata(msg.get("display_metadata")),
                 ),
             )
-            if isinstance(msg, dict) and cur.lastrowid is not None:
-                msg["_row_id"] = cur.lastrowid
+            inserted_id = cur.fetchone()[0]
+            if isinstance(msg, dict):
+                msg["_row_id"] = inserted_id
             inserted += 1
             if tool_calls is not None:
                 tool_calls_total += (
@@ -12693,7 +12694,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "SELECT id FROM messages "
                 "WHERE session_id = ? AND role = 'user' AND active = 1 "
                 "ORDER BY id DESC LIMIT 1"
-                ") AND content IS ?",
+                ") AND content IS NOT DISTINCT FROM ?",
                 (_scrub_surrogates(api_content), session_id, encoded),
             )
             return cursor.rowcount
@@ -12825,7 +12826,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if limit is not None or offset:
                 # SQLite's OFFSET requires LIMIT; -1 means "no limit".
                 sql += " LIMIT ? OFFSET ?"
-                params.extend([-1 if limit is None else limit, offset])
+                params.extend([(None if getattr(self, 'is_postgres', False) else -1) if limit is None else limit, offset])
             with self._read_ctx() as conn:
                 cursor = conn.execute(sql, params)
                 rows = cursor.fetchall()

@@ -149,6 +149,12 @@ def default_db_path() -> Path:
 
 
 def _connect_readonly(db_path: Path) -> sqlite3.Connection:
+    from hermes_cli.session_postgres import connection_for
+    native = connection_for(db_path, read_only=True)
+    if native is not None:
+        return native
+    if not db_path.exists():
+        return None
     uri = f"file:{db_path}?mode=ro"
     return sqlite3.connect(uri, uri=True)
 
@@ -220,13 +226,13 @@ def scan_approval_history(
     from tools.approval import detect_dangerous_command, detect_hardline_command
 
     path = Path(db_path) if db_path else default_db_path()
-    if not path.exists():
-        return []
 
     since_ts = 0.0 if days <= 0 else time.time() - days * 86400
 
     records: list[tuple[str, str]] = []
     con = _connect_readonly(path)
+    if con is None:
+        return []
     try:
         blocked = _blocked_tool_call_ids(con, since_ts)
         for tool_call_id, command in _iter_terminal_calls(con, since_ts):

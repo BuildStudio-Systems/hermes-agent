@@ -1,8 +1,8 @@
 # SessionDB PostgreSQL migration preparation
 
-Date: 2026-10-08 JST. **Offline migration and native auxiliary runtime preparation.
+Date: 2026-10-08 JST. **Offline migration, native auxiliary runtime and core transcript/search preparation.
 The running SessionDB still uses SQLite. Production activation remains blocked
-until the transcript/search and remaining direct consumers are migrated.**
+until the remaining direct consumers and controlled cutover are complete.**
 
 ## What is implemented
 
@@ -101,6 +101,69 @@ bounded pool. The 15 offline importer tests and prior operational/cron PG tests
 also passed. Initial test/integration failures are retained separately; this was
 not a clean first run. No production process, profile or database was switched.
 
+## Core transcript/search preparation — source only
+
+`hermes_state_postgres.PostgresSessionDB` reuses the existing SessionDB business
+methods with native pooled transactions. The ordinary `SessionDB` constructor
+still refuses the `sessions` selection: this is an isolated integration engine,
+not permission to enable it in production. Package metadata includes the new
+module and offline runtime SQL.
+
+Covered behavior includes prompts and transcripts, imported/deleted identity
+high-water marks, export/import, token accounting and per-model attribution,
+activity/preview/listing, title lineage, prune filters, turn/compression leases,
+and Telegram topic opt-in. Core SQL now uses explicit conflict targets,
+`RETURNING id`, null-safe comparisons, typed nullable cost parameters and
+qualified upsert counters. SQLite regressions passed as well.
+
+Read contexts use one repeatable read snapshot, and the server enforces their
+read-only status. Only failures before business SQL begins can receive bounded
+admission retries. Statement errors and ambiguous COMMIT acknowledgements are
+not replayed. Core standalone autocommit preserves the existing core handle
+contract; auxiliary ledger handles retain their explicit transaction contract.
+
+`session_postgres_runtime.sql` is an offline, transactional, first-install
+migration for narrow JSON lineage functions and three native GIN indexes. The
+DBA must provision `pg_trgm` in `public` first. Runtime DML credentials must not
+receive schema/table creation or maintenance ownership. This script is separate
+from the empty-schema importer and must be applied after importing the snapshot.
+
+Search matches complete content/tool-name/tool-call fields with parameterized
+native expressions and trigram indexes. It supports word terms, quoted phrases,
+AND/OR/NOT, prefixes, literal CJK substrings, source/role filters, pagination,
+time sorting and field projection. It does not truncate searchable large tool
+outputs into a size-limited tsvector. Relevance uses normalized term frequency,
+**not SQLite BM25**; exact ranking/tokenization equivalence is not claimed.
+Rewound rows are excluded from default matches and context; archived compaction
+rows remain searchable. Context and snippets are bounded in returned results.
+Native vacuum/reindex remain explicit DBserver maintenance responsibilities.
+
+Readiness and unclean-exit probes select PostgreSQL before inspecting retained
+files and fail closed on broken configuration/schema. The latter reports
+`postgresql-schema-ok`, which proves schema reachability, not physical database
+integrity. Approval-history scanning also selects the native read-only store.
+SQLite FTS conversion/backfill statuses are inapplicable to native indexes.
+
+Latest canonical run: **341 passed, 0 failed, 1 platform skipped**, 14 files,
+including **76 core PostgreSQL tests** and the earlier 54 ledger tests. A separate
+broader run passed the 243 existing SessionDB cases and 9 batch-insert cases
+(two additional capability skips); these are separate receipts, not a single
+combined run. Intermediate import-fixture, type-inference, named-parameter,
+upsert-ambiguity and test-portability failures were retained and fixed.
+
+Private DB-host rehearsal imported the retained real snapshot into an isolated
+PostgreSQL cluster. **256 sessions / 4,024 messages** produced identical complete
+exports, session listings and model-consumable conversations through the SQLite
+and PostgreSQL readers. Synthetic chat/usage/multilingual search passed, and no
+local `state.db` was created. The snapshot SHA-256 stayed
+`70c30f2dad84182951b5b2b921750a1830be28729a71113025c033efaa2cf9c2`.
+Canonical read-payload digest:
+`6c96d735bdda73b2c8b3eee7c8bf770931b78c8d7530bd1020a16be5d2a5b80d`.
+No conversation body or credentials were published. This earlier snapshot is
+rehearsal evidence only; final cutover still needs a new backup with all writers
+stopped, current role/connection-budget validation, live API acceptance and an
+independent restore of the final production dump.
+
 ## Remaining runtime integration — do not activate yet
 
 Changing a connection URL alone is insufficient. These paths still need native
@@ -108,9 +171,9 @@ PostgreSQL behavior and real functional tests:
 
 | Component | Required behavior |
 | --- | --- |
-| `hermes_state.py`, common/schema/search/portability mixins | Transcript and prompt persistence, model usage, activity, compression and turn leases, transactional guards, export/import, native full-text and CJK search, pagination and previews |
+| Core transcript/search | Native integration and real-snapshot read parity completed above; ordinary constructor activation, broader API/consumer integration and production cutover remain |
 | Rooms, driver, policy, asynchronous delegation and delivery | Native source/tests completed above; release only with the complete shared-session cutover |
-| Gateway readiness/lifecycle, CLI observability/recovery/backup, A2A adapter | Read the selected backend rather than a stale retained SQLite file; native backup/restore and health checks |
+| Direct consumers | Readiness/lifecycle and approval-history scanning adapted; CLI observability/recovery/backup, cross-profile search and A2A still require native handling rather than stale file reads |
 | Projects/optional plugins, shared metrics | Audit lazy creation of separate SQLite stores; absence of an open descriptor is not proof these paths cannot create one later. Cron is already migrated. |
 
 The current production Agent still opens `state.db`, `state.db-wal` and

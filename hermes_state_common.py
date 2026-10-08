@@ -58,7 +58,7 @@ def escape_like(text: str) -> str:
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-_PREVIEW_CONTENT_SQL = "REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' ')"
+_PREVIEW_CONTENT_SQL = "REPLACE(REPLACE(m.content, '\n', ' '), '\r', ' ')"
 
 
 _PREVIEW_SCAFFOLDED_SQL = f"m.content LIKE '{SKILL_SCAFFOLD_SQL_LIKE}'"
@@ -68,7 +68,7 @@ def _sql_literal(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
-_SQL_WHITESPACE = "CHAR(9) || CHAR(10) || CHAR(13) || CHAR(32)"
+_SQL_WHITESPACE = "'\t\n\r '"
 
 
 def _sql_ltrim_whitespace(expression: str) -> str:
@@ -151,7 +151,7 @@ _PREVIEW_RAW_SELECT = (
     f" AND LENGTH(m.content) > {_PREVIEW_SCAFFOLD_WINDOW * 2}"
     f" THEN SUBSTR({_PREVIEW_CONTENT_SQL}, 1, {_PREVIEW_SCAFFOLD_WINDOW})"
     f" || '{SKILL_EXCERPT_JOINT}'"
-    f" || SUBSTR({_PREVIEW_CONTENT_SQL}, -{_PREVIEW_SCAFFOLD_WINDOW})"
+    f" || SUBSTR({_PREVIEW_CONTENT_SQL}, LENGTH({_PREVIEW_CONTENT_SQL}) - {_PREVIEW_SCAFFOLD_WINDOW} + 1)"
     f" WHEN {_PREVIEW_SCAFFOLDED_SQL}"
     f" THEN SUBSTR({_PREVIEW_CONTENT_SQL}, 1, {_PREVIEW_SCAFFOLD_WINDOW * 2})"
     f" ELSE SUBSTR({_PREVIEW_CONTENT_SQL}, 1, {_PREVIEW_HEAD_CHARS}) END"

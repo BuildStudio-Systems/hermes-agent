@@ -26,6 +26,18 @@ def _check(status: str, detail: str | None = None, **extra: Any) -> dict[str, An
 
 def _probe_state_db(home: Path) -> dict[str, Any]:
     path = home / "state.db"
+    try:
+        from hermes_cli.session_postgres import connection_for
+        native = connection_for(path, read_only=True, timeout=1)
+        if native is not None:
+            with closing(native):
+                native.validate_schema()
+                native.execute("SELECT json_extract(?, ?)", ('{"_reset_from":"probe"}', '$._reset_from')).fetchone()
+            return _check("ok", "PostgreSQL schema reachable", backend="postgresql")
+    except Exception as exc:
+        # A selected remote store must never report the retained SQLite
+        # snapshot (or the absence of that snapshot) as healthy live storage.
+        return _check("degraded", type(exc).__name__)
     if not path.exists():
         return _check("ok", "not initialized")
     try:
