@@ -60,7 +60,7 @@ from hermes_cli.archive_safe import (
 )
 
 ARCHIVE_FORMAT = "hermes-kanban-board"
-ARCHIVE_FORMAT_VERSION = 1
+ARCHIVE_FORMAT_VERSION = 2
 
 # Statuses from which the dispatcher can still act on a task. A task whose
 # workspace cannot be rebuilt on this machine is parked in ``triage`` only
@@ -168,7 +168,9 @@ def export_board(
         raise ValueError(f"board {slug!r} does not exist")
 
     db_path = kb.kanban_db_path(slug)
-    if not db_path.exists():
+    from hermes_cli.postgres_runtime import configuration
+    postgres = configuration('kanban') is not None
+    if not postgres and not db_path.exists():
         raise FileNotFoundError(f"board {slug!r} has no database at {db_path}")
 
     output = Path(output_path).expanduser()
@@ -179,13 +181,16 @@ def export_board(
         staged = Path(tmpdir) / slug
         staged.mkdir(parents=True)
 
-        _snapshot_db(db_path, staged / "kanban.db")
-        # The snapshot is a private file with no other writers, so plain
-        # commit/close is enough — no need for the board DB's WAL dance.
-        with contextlib.closing(sqlite3.connect(str(staged / "kanban.db"))) as snapshot:
-            _scrub_local_state(snapshot)
-            snapshot.commit()
-            counts = _count_rows(snapshot)
+        if postgres:
+            from hermes_cli.kanban_postgres_transfer import write_snapshot
+            with kb.connect_closing(board=slug) as conn:
+                counts = write_snapshot(conn,staged/'kanban.json')
+        else:
+            _snapshot_db(db_path, staged / "kanban.db")
+            with contextlib.closing(sqlite3.connect(str(staged / "kanban.db"))) as snapshot:
+                _scrub_local_state(snapshot)
+                snapshot.commit()
+                counts = _count_rows(snapshot)
 
         meta = kb.read_board_metadata(slug)
         # Both name a location on the exporting machine; the importer
@@ -213,7 +218,7 @@ def export_board(
 
         manifest = {
             "format": ARCHIVE_FORMAT,
-            "format_version": ARCHIVE_FORMAT_VERSION,
+            "format_version": 2 if postgres else 1,
             "board": slug,
             "board_name": meta.get("name") or slug,
             "exported_at": int(time.time()),
@@ -293,7 +298,7 @@ def _read_board_metadata(path: Path) -> dict[str, Any]:
 
 
 def _relocate_imported_rows(
-    conn: sqlite3.Connection, slug: str
+    conn: sqlite3.Connection, slug: str, *, allow_nested: bool = False
 ) -> tuple[dict[str, int], list[str]]:
     """Re-anchor an imported board's rows to this machine.
 
@@ -316,7 +321,7 @@ def _relocate_imported_rows(
     now = int(time.time())
     attachments_dir = kb.attachments_root(slug)
 
-    with kb.write_txn(conn):
+    with kb.write_txn(conn, allow_nested=allow_nested):
         _scrub_local_state(conn)
 
         dropped = 0
@@ -383,6 +388,51 @@ def _relocate_imported_rows(
     return {"attachments": rehomed, "parked": len(parked)}, warnings
 
 
+def _import_postgres_archive(extracted, manifest, slug, activate):
+    from hermes_cli.postgres_runtime import configuration
+    from hermes_cli.kanban_postgres_transfer import read_snapshot, import_snapshot, legacy_snapshot
+    if configuration('kanban') is None:
+        raise ValueError('This board archive requires a PostgreSQL profile')
+    if manifest.get('format_version') == 2:
+        payload = read_snapshot(extracted/'kanban.json')
+    else:
+        with kb.connect_closing(board='default') as conn:
+            payload = legacy_snapshot(conn,extracted/'kanban.db')
+    requested = kb._normalize_board_slug(slug or manifest.get('board'))
+    if not requested:
+        raise ValueError('A board name is required')
+    target = _available_slug(requested)
+    meta = _read_board_metadata(extracted/'board.json')
+    # Exclusive directory creation prevents a concurrent import from overwriting.
+    root = kb.board_dir(target)
+    root.mkdir(parents=True,exist_ok=False)
+    try:
+        for tree in ('attachments','logs'):
+            source = extracted/tree
+            if source.is_dir():
+                copy_regular_files(source,root/tree)
+        name = str(meta.get('name') or manifest.get('board_name') or target)
+        kb.write_board_metadata(target,name=name,description=str(meta.get('description') or ''),
+                                icon=str(meta.get('icon') or ''),color=str(meta.get('color') or ''),archived=False)
+        with kb.connect_closing(board=target) as conn:
+            with kb.write_txn(conn):
+                import_snapshot(conn,payload)
+                stats,warnings = _relocate_imported_rows(conn,target,allow_nested=True)
+                counts = _count_rows(conn)
+    except Exception:
+        # Keep a failed import isolated and discoverable. Never delete data on an
+        # uncertain COMMIT outcome; a retry receives a new board name.
+        kb.write_board_metadata(target,archived=True,description='Import did not complete; inspect before reuse.')
+        raise
+    if activate:
+        kb.set_current_board(target)
+    return {'board':target,'requested_board':requested,'renamed':target!=requested,'name':name,
+            'path':str(root),'db_path':str(kb.kanban_db_path(target)),
+            'source':{k:manifest.get(k) for k in ('board','exported_at','hermes_version')},
+            'counts':counts,'attachments_restored':stats['attachments'],'tasks_parked':stats['parked'],
+            'warnings':warnings,'activated':bool(activate)}
+
+
 def import_board(
     archive_path: str,
     slug: Optional[str] = None,
@@ -412,6 +462,9 @@ def import_board(
         extracted = staging / archive_root
 
         manifest = _read_manifest(extracted)
+        from hermes_cli.postgres_runtime import configuration
+        if manifest.get('format_version') == 2 or configuration('kanban') is not None:
+            return _import_postgres_archive(extracted, manifest, slug, activate)
         staged_db = extracted / "kanban.db"
         if not staged_db.is_file():
             raise ValueError("archive is missing kanban.db")

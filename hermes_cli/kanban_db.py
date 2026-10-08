@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+from hermes_cli.kanban_postgres import insert_id as _insert_id
 import hashlib
 import json
 import os
@@ -1015,6 +1016,19 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if normed == DEFAULT_BOARD:
         raise ValueError("the 'default' board cannot be removed")
     d = board_dir(normed)
+    from hermes_cli.kanban_postgres import connect_if_configured
+    postgres = connect_if_configured(d / 'kanban.db')
+    if postgres is not None:
+        with contextlib.closing(postgres):
+            if archive:
+                target_name = f'_archived/{normed}-{int(time.time())}-{secrets.token_hex(4)}'
+            else:
+                target_name = f'_deleted/{postgres.board}'
+            target = postgres.remove_board(target_name, archive=archive)
+        if get_current_board() == normed:
+            clear_current_board()
+        return {'slug':normed, 'action':'archived' if archive else 'deleted',
+                'new_path':str(target) if archive else ''}
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
 
@@ -1722,6 +1736,12 @@ def _dispatch_tick_lock(db_path: Path):
     (yields ``True``) — single-writer enforcement is best-effort and the
     orphan-dispatcher scenario is specific to POSIX service managers.
     """
+    from hermes_cli.kanban_postgres import connect_if_configured
+    postgres = connect_if_configured(db_path)
+    if postgres is not None:
+        with contextlib.closing(postgres), postgres.dispatch_lock() as acquired:
+            yield acquired
+        return
     lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
     handle = None
     acquired = False
@@ -1807,6 +1827,8 @@ def _maybe_checkpoint_wal(conn: sqlite3.Connection, db_path: Path) -> None:
     elapsed since this process last checkpointed this board. Never raises:
     the checkpoint is pure hygiene and must not fail a dispatch tick.
     """
+    if getattr(conn, "is_postgres", False):
+        return
     try:
         key = str(db_path.resolve())
     except OSError:
@@ -2257,6 +2279,9 @@ def repair_db(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    from hermes_cli.postgres_runtime import configuration
+    if configuration('kanban') is not None:
+        raise RuntimeError('This board uses PostgreSQL. Local SQLite repair is inapplicable; use database-server integrity and restore procedures.')
     try:
         resolved = path.resolve()
     except OSError:
@@ -2362,6 +2387,10 @@ def connect(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    from hermes_cli.kanban_postgres import connect_if_configured
+    postgres = connect_if_configured(path)
+    if postgres is not None:
+        return postgres
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -3075,6 +3104,10 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     shadow the original exception with a spurious rollback error.
     """
     _assert_not_delegated_child_mutation()
+    if getattr(conn, "is_postgres", False):
+        with conn.write_transaction(allow_nested=allow_nested):
+            yield conn
+        return
     if getattr(conn, "in_transaction", False):
         if not allow_nested:
             raise RuntimeError(
@@ -3539,7 +3572,7 @@ def create_task(
                 )
                 for pid in parents:
                     conn.execute(
-                        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                        "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
                         (pid, task_id),
                     )
                 # Notify-sub inheritance (ACK-edge: the originating channel
@@ -3567,7 +3600,9 @@ def create_task(
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
-        except sqlite3.IntegrityError:
+        except Exception as exc:
+            if not isinstance(exc, sqlite3.IntegrityError) and not str(getattr(exc, "sqlstate", "")).startswith("23"):
+                raise
             if attempt == 1:
                 raise
             # Retry with a fresh id.
@@ -3620,7 +3655,7 @@ def _inherit_notify_subs(
     placeholders = ",".join("?" * len(parent_ids))
     conn.execute(
         f"""
-        INSERT OR IGNORE INTO kanban_notify_subs
+        INSERT INTO kanban_notify_subs
             (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
              chat_type, notifier_profile, delivery_mode, delivery_metadata,
              created_at, last_event_id)
@@ -3629,6 +3664,7 @@ def _inherit_notify_subs(
                COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
           FROM kanban_notify_subs
          WHERE task_id IN ({placeholders})
+        ON CONFLICT DO NOTHING
         """,
         (
             child_id,
@@ -3849,7 +3885,7 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
                 f"linking {parent_id} -> {child_id} would create a cycle"
             )
         conn.execute(
-            "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+            "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
             (parent_id, child_id),
         )
         # If child was ready but parent is not yet done, demote child to todo.
@@ -4005,13 +4041,13 @@ def add_comment(
             "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
         ).fetchone():
             raise ValueError(f"unknown task {task_id}")
-        cur = conn.execute(
+        new_id = _insert_id(conn,
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)",
             (task_id, author.strip(), body.strip(), now),
         )
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
+        return new_id
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
@@ -4199,7 +4235,7 @@ def add_attachment(
             "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
         ).fetchone():
             raise ValueError(f"unknown task {task_id}")
-        cur = conn.execute(
+        new_id = _insert_id(conn,
             "INSERT INTO task_attachments "
             "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -4219,7 +4255,7 @@ def add_attachment(
             "attached",
             {"filename": filename.strip(), "size": int(size), "by": uploaded_by},
         )
-        return int(cur.lastrowid or 0)
+        return new_id
 
 
 def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]:
@@ -4427,7 +4463,7 @@ def _synthesize_ended_run(
     ).fetchone()
     profile = trow["assignee"] if trow else None
     step_key = trow["current_step_key"] if trow else None
-    cur = conn.execute(
+    new_id = _insert_id(conn,
         """
         INSERT INTO task_runs (
             task_id, profile, step_key,
@@ -4444,7 +4480,7 @@ def _synthesize_ended_run(
             now, now,
         ),
     )
-    return int(cur.lastrowid or 0)
+    return new_id
 
 
 # ---------------------------------------------------------------------------
@@ -4708,7 +4744,7 @@ def claim_task(
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
-        run_cur = conn.execute(
+        run_id = _insert_id(conn,
             """
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
@@ -4726,7 +4762,6 @@ def claim_task(
                 now,
             ),
         )
-        run_id = run_cur.lastrowid
         conn.execute(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
@@ -4806,7 +4841,7 @@ def claim_review_task(
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
-        run_cur = conn.execute(
+        run_id = _insert_id(conn,
             """
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
@@ -4824,7 +4859,6 @@ def claim_review_task(
                 now,
             ),
         )
-        run_id = run_cur.lastrowid
         conn.execute(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
@@ -7457,8 +7491,8 @@ def decompose_triage_task(
                 parent_id = child_ids[p_idx]
                 child_id = child_ids[idx]
                 conn.execute(
-                    "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
-                    "VALUES (?, ?)",
+                    "INSERT INTO task_links (parent_id, child_id) "
+                    "VALUES (?, ?) ON CONFLICT DO NOTHING",
                     (parent_id, child_id),
                 )
                 _append_event(
@@ -7472,8 +7506,8 @@ def decompose_triage_task(
         # only ever a child here, never a parent of children.
         for cid in child_ids:
             conn.execute(
-                "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
-                "VALUES (?, ?)",
+                "INSERT INTO task_links (parent_id, child_id) "
+                "VALUES (?, ?) ON CONFLICT DO NOTHING",
                 (cid, task_id),
             )
 
@@ -11451,12 +11485,13 @@ def add_notify_sub(
     with write_txn(conn):
         conn.execute(
             """
-            INSERT OR IGNORE INTO kanban_notify_subs
+            INSERT INTO kanban_notify_subs
                 (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
                  chat_type, notifier_profile, delivery_mode, delivery_metadata,
                  created_at, last_event_id)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
+            ON CONFLICT DO NOTHING
             """,
             (
                 task_id,
@@ -11628,9 +11663,12 @@ def count_notify_subs(
     (locked, corrupt); callers choose their own fallback.
     """
     path = db_path if db_path is not None else kanban_db_path(board=board)
-    if not path.exists():
-        return 0
-    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    from hermes_cli.kanban_postgres import connect_if_configured
+    conn = connect_if_configured(path)
+    if conn is None:
+        if not path.exists():
+            return 0
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
     try:
         try:
             owner_where, owner_params = _notify_profile_filter(

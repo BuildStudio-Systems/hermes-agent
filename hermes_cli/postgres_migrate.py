@@ -74,8 +74,8 @@ def import_stores(source_home: Path, settings: dict, scopes=None):
     import psycopg
     from psycopg import sql
 
-    scopes = list(scopes if scopes is not None else SCOPES)
-    if not scopes or set(scopes) - SCOPES.keys() or len(scopes) != len(set(scopes)):
+    scopes = list(scopes if scopes is not None else SCHEMA_SQL)
+    if not scopes or set(scopes) - SCHEMA_SQL.keys() or len(scopes) != len(set(scopes)):
         raise ValueError("Invalid migration scopes")
     for scope in scopes:
         if not re.fullmatch(r"agent_[a-z0-9_]{1,48}", settings["schemas"][scope]):

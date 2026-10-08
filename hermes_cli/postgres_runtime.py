@@ -2,7 +2,8 @@
 
 This is not a SQLite SQL translator. Callers use portable DML; the only DB-API
 difference handled here is qmark parameters. Schema creation/import are offline.
-Session transcripts and kanban are deliberately not routed through this adapter.
+Session transcripts are not routed through this adapter. Kanban subclasses
+the connection for native board transactions and row isolation.
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ SCOPES = {
     "runs": ("runs_idempotency.db", ("run_idempotency",)),
     "artifacts": ("cache/chat-files/index.sqlite3", ("chat_file_artifacts",)),
     "verification": ("verification_evidence.db", ("meta", "verification_events", "verification_state")),
+    "kanban": ("kanban.db", ("board_registry", "board_fs_operations", "tasks", "task_links", "task_comments", "task_events", "task_runs", "task_attachments", "kanban_notify_subs")),
 }
 _pools = {}
 _pool_lock = threading.Lock()
@@ -136,6 +138,9 @@ def configuration(scope: str, db_path=None):
 
 
 def connection_for(scope: str, db_path=None):
+    if scope == 'kanban':
+        from hermes_cli.kanban_postgres import connect_if_configured
+        return connect_if_configured(db_path or get_hermes_home()/'kanban.db')
     settings = configuration(scope, db_path)
     if settings is None:
         return None

@@ -25,7 +25,7 @@ def pg(tmp_path, monkeypatch):
     from psycopg import sql
     connection = json.loads(config.read_text())
     assert connection["dbname"] == "test_agent_operational", "refuse non-test database"
-    schemas = {scope: "agent_test_" + uuid.uuid4().hex for scope in runtime.SCOPES}
+    schemas = {scope: "agent_test_" + uuid.uuid4().hex for scope in SCHEMA_SQL}
     role = "agent_test_" + uuid.uuid4().hex
     password = secrets.token_hex(24)
     home = tmp_path / "profile"
