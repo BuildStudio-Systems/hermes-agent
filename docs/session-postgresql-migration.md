@@ -237,3 +237,34 @@ An existing EOF test used a scalar instead of valid YAML profile config; correct
 the fixture so the test continues to exercise the EOF confirmation path.
 These changes are not deployed and do not replace the final stopped-writer DBserver
 backup/import/restore/role acceptance required before production session activation.
+
+## Final runtime entry preparation (2026-10-08, not a deployment receipt)
+
+The public SessionDB constructor now selects the native engine for an explicitly
+configured sessions store. Configuration, schema/function or connection failure
+cannot create or select a retained SQLite database. The API's synchronous and
+asynchronous caches refuse missing or stale local handles for a selected native
+profile; failed transcript reads stop processing instead of supplying empty history.
+Insights chooses native query plans without SQLite catalog probes or INDEXED BY.
+Automatic pruning delegates physical vacuum to the database maintenance role.
+
+The preceding gateway/content phase passed 730 tests with one platform skip.
+Content encoding preserves legacy NUL-prefixed multimodal JSON, embedded NUL,
+reserved envelope prefixes and binary content. Import receipts hash encoded
+canonical storage rows after checking reversibility; physical TEXT encoding is
+not asserted to match SQLite bytes. Ordinary JSON import retains its pre-existing
+binary-payload limitation. Composite rewind uses the inserted row identity.
+
+Final entry/API regression: 373 passed, zero failed, eight files, including 105
+native core, 54 auxiliary and 28 native analytics contracts. The isolated test
+aiohttp was corrected from 3.13.3 to the project's/runtime's 3.14.3; earlier API
+failures were retained as dependency evidence. Earlier SQLite core regression
+passed 243 tests with two platform skips. Fixture path/end-reason mistakes were
+fixed without relaxing backend selection. The 256-session/4024-message snapshot
+rehearsal still matches exports, listings and replay exactly. A disposable DML-only
+role passed create/read/update/delete, search, counters and reports and could not
+create tables. This does not substitute for the final production-role check.
+
+Production activation still requires a new stopped-writer snapshot, verified
+import, independent PostgreSQL dump restore and actual runtime-role acceptance.
+Source support alone does not mean production state.db has been retired.

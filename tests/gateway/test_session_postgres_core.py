@@ -47,6 +47,113 @@ def test_transcript_prompt_and_usage_roundtrip(database):
     assert '你好' in rows[0]['preview']
 
 
+def test_public_constructor_selects_native_store_without_local_database(database):
+    from hermes_state import SessionDB
+    with SessionDB() as writer:
+        assert type(writer) is PostgresSessionDB
+        writer.create_session('factory', source='api')
+        writer.append_message('factory', 'user', 'native constructor')
+    with SessionDB(database.db_path, read_only=True) as reader:
+        assert reader.is_postgres
+        assert reader.get_messages('factory')[0]['content'] == 'native constructor'
+        with pytest.raises(PermissionError):
+            reader.append_message('factory', 'user', 'not permitted')
+    assert database.get_session('factory')
+    assert not database.db_path.exists()
+
+
+def test_native_auto_prune_leaves_physical_vacuum_to_database_role(database, monkeypatch):
+    database.create_session('old-session', source='api')
+    database.end_session('old-session', 'completed')
+    database._conn.execute("UPDATE sessions SET started_at=1,ended_at=2 WHERE id='old-session'")
+    monkeypatch.setattr(database, 'vacuum', lambda: pytest.fail('runtime must not run physical vacuum'))
+    result = database.maybe_auto_prune_and_vacuum(retention_days=1, min_interval_hours=0)
+    assert result['pruned'] == 1
+    assert not result['vacuumed']
+    assert 'error' not in result
+    assert database.get_session('old-session') is None
+
+
+@pytest.mark.asyncio
+async def test_api_session_open_uses_native_store_and_failure_never_becomes_memory_only(database, monkeypatch):
+    from gateway.platforms.api_server import APIServerAdapter
+    from gateway.config import PlatformConfig
+    from gateway.session_db_recovery import RequiredSessionStoreUnavailable
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={'key': 'synthetic-api-test'}))
+    try:
+        sync = adapter._ensure_session_db()
+        assert sync.is_postgres
+        assert await adapter._ensure_session_db_async() is sync
+        sync.create_session('api-native', source='api')
+        assert database.get_session('api-native')
+        def unreadable(*args):
+            raise ConnectionError('private transcript error')
+        monkeypatch.setattr(sync, 'get_messages_as_conversation', unreadable)
+        with pytest.raises(RequiredSessionStoreUnavailable, match='Required session history'):
+            await adapter._conversation_history_for_session('api-native')
+        adapter._close_cached_session_dbs()
+        for operation in ('sync', 'async'):
+            with pytest.raises(RequiredSessionStoreUnavailable, match='Required session storage'):
+                if operation == 'sync':
+                    adapter._ensure_session_db()
+                else:
+                    await adapter._ensure_session_db_async()
+        adapter._session_db_cache_closed = False
+        def broken(*args):
+            raise ConnectionError('private diagnostic must not reach client')
+        monkeypatch.setattr(adapter, '_open_and_cache_session_db', broken)
+        with pytest.raises(RequiredSessionStoreUnavailable) as error:
+            await adapter._ensure_session_db_async()
+        assert 'private diagnostic' not in str(error.value)
+        with pytest.raises(RequiredSessionStoreUnavailable):
+            adapter._ensure_session_db()
+    finally:
+        adapter._close_cached_session_dbs()
+
+
+def test_native_core_works_with_dml_only_role(database):
+    import psycopg
+    from psycopg import sql
+    import secrets
+    import uuid
+    from hermes_cli.session_postgres import close_pools
+    from hermes_state import SessionDB
+    credentials = database.db_path.parent / 'credentials.json'
+    original = credentials.read_text()
+    settings = database._settings
+    role = 'agent_core_' + uuid.uuid4().hex
+    with psycopg.connect(**settings['connection'], autocommit=True) as admin:
+        admin.execute(sql.SQL('CREATE ROLE {} LOGIN PASSWORD {}').format(sql.Identifier(role), sql.Literal(secrets.token_hex(24))))
+        admin.execute(sql.SQL('GRANT USAGE ON SCHEMA {} TO {}').format(sql.Identifier(settings['schema']), sql.Identifier(role)))
+        admin.execute(sql.SQL('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {} TO {}').format(sql.Identifier(settings['schema']), sql.Identifier(role)))
+        admin.execute(sql.SQL('GRANT USAGE ON ALL SEQUENCES IN SCHEMA {} TO {}').format(sql.Identifier(settings['schema']), sql.Identifier(role)))
+        # The isolated test cluster uses trust for its Unix socket, but TLS
+        # clients authenticate with SCRAM, as the deployed role must do.
+        password = secrets.token_hex(24)
+        admin.execute(sql.SQL('ALTER ROLE {} PASSWORD {}').format(sql.Identifier(role), sql.Literal(password)))
+        value = json.loads(original)
+        value['connection'].update(user=role, password=password)
+        credentials.write_text(json.dumps(value))
+        try:
+            with SessionDB() as runtime:
+                runtime.create_session('least-privilege', source='api')
+                runtime.append_message('least-privilege', 'user', '权限 проверка')
+                runtime.update_token_counts('least-privilege', input_tokens=10, output_tokens=2, model='local')
+                assert runtime.get_session('least-privilege')['input_tokens'] == 10
+                assert runtime.search_messages('权限')
+                assert runtime.export_session('least-privilege')['messages']
+                from agent.insights import InsightsEngine
+                assert InsightsEngine(runtime).generate()['overview']['total_sessions'] == 1
+                with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                    runtime._conn.execute('CREATE TABLE forbidden(id integer)')
+                runtime.delete_session('least-privilege')
+        finally:
+            credentials.write_text(original)
+            close_pools()
+            admin.execute(sql.SQL('DROP OWNED BY {}').format(sql.Identifier(role)))
+            admin.execute(sql.SQL('DROP ROLE {}').format(sql.Identifier(role)))
+
+
 def test_named_profile_search_and_a2a_use_target_backend(database, tmp_path, monkeypatch):
     from hermes_cli import profiles
     from hermes_constants import get_hermes_home, set_hermes_home_override, reset_hermes_home_override

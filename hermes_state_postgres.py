@@ -1,4 +1,4 @@
-"""Native SessionDB engine, under integration test until public activation.
+"""Native SessionDB engine selected by explicit profile storage configuration.
 
 Business methods remain in SessionDB. This class replaces file recovery, WAL,
 connection ownership and transaction handling with PostgreSQL operations.
@@ -12,7 +12,7 @@ from pathlib import Path
 import threading
 import time
 
-from hermes_state import SessionDB, SessionCompressionInProgressError, _ensure_test_isolation
+from hermes_state import SessionDB, SessionCompressionInProgressError, _ensure_test_isolation, _default_db_path
 from hermes_cli.postgres_runtime import configuration
 from hermes_cli.session_postgres import SessionConnection, SessionAdmissionBusy
 
@@ -30,8 +30,8 @@ class PostgresSessionDB(SessionDB):
         from hermes_cli.session_content_codec import decode_legacy
         return super()._decode_content(decode_legacy(content))
 
-    def __init__(self, db_path: Path, read_only=False):
-        self.db_path = Path(db_path)
+    def __init__(self, db_path: Path = None, read_only=False):
+        self.db_path = Path(db_path or _default_db_path())
         _ensure_test_isolation(self.db_path)
         self._settings = configuration('sessions', self.db_path)
         if self._settings is None:

@@ -24,6 +24,10 @@ def profile(tmp_path, monkeypatch):
     home = tmp_path / 'home'
     home.mkdir()
     monkeypatch.setenv('HERMES_HOME', str(home))
+    import hermes_state
+    # Global test isolation pins DEFAULT_DB_PATH to its own sandbox. This
+    # fixture has a more specific profile and must exercise runtime resolution.
+    monkeypatch.setattr(hermes_state, 'DEFAULT_DB_PATH', hermes_state._IMPORT_DEFAULT_DB_PATH)
     settings = {'connection': connection, 'schema': schema, 'profile': str(home)}
     with psycopg.connect(**connection) as db:
         db.execute(sql.SQL('CREATE SCHEMA {}').format(sql.Identifier(schema)))
@@ -104,10 +108,11 @@ def test_readonly_is_enforced_by_database_even_for_cte(profile):
         assert conn.execute('SELECT count(*) FROM state_meta').fetchone()[0] == 0
 
 
-def test_profile_does_not_fall_back_and_core_activation_is_blocked(profile):
+def test_profile_does_not_fall_back_and_missing_runtime_migration_is_rejected(profile):
     path, _ = profile
     from hermes_state import SessionDB
-    with pytest.raises(RuntimeError, match='awaits final cutover readiness'):
+    import psycopg
+    with pytest.raises(psycopg.errors.UndefinedFunction):
         SessionDB(path)
     with pytest.raises(ValueError, match='override'):
         pg.connection_for(path.parent/'different.db')

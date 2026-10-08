@@ -115,15 +115,20 @@ class InsightsEngine:
         # A read-only open of a state.db written by an older version skips
         # schema init and lacks the partial index — probe once and fall back
         # to the unpinned variants (identical rows, optimizer-chosen plan).
-        try:
-            self._has_assistant_calls_index = bool(
-                self._conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
-                    (self._MESSAGES_ASSISTANT_CALLS_INDEX,),
-                ).fetchone()
-            )
-        except sqlite3.Error:
+        if getattr(db, "is_postgres", False):
+            # PostgreSQL chooses its own plan. Do not probe SQLite catalogs or
+            # send INDEXED BY through the native connection.
             self._has_assistant_calls_index = False
+        else:
+            try:
+                self._has_assistant_calls_index = bool(
+                    self._conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+                        (self._MESSAGES_ASSISTANT_CALLS_INDEX,),
+                    ).fetchone()
+                )
+            except sqlite3.Error:
+                self._has_assistant_calls_index = False
         if not self._has_assistant_calls_index:
             _strip = f" INDEXED BY {self._MESSAGES_ASSISTANT_CALLS_INDEX}"
             # Loop over every pinned statement so adding a new one can't

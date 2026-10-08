@@ -2741,6 +2741,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._session_dbs[key] = db
             return db
 
+    @staticmethod
+    def _checked_session_db(db):
+        from gateway.session_db_recovery import requires_postgres, RequiredSessionStoreUnavailable
+        if requires_postgres() and (db is None or not getattr(db, 'is_postgres', False)):
+            raise RequiredSessionStoreUnavailable('Required session storage is unavailable')
+        return db
+
     def _close_cached_session_dbs(self) -> None:
         """Close SessionDB handles owned by this adapter's profile cache."""
         with self._session_db_cache_lock:
@@ -2771,13 +2778,16 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         # Explicit override (tests / manual wiring) wins.
         if self._session_db is not None:
-            return self._session_db
+            return self._checked_session_db(self._session_db)
         try:
             from hermes_constants import get_hermes_home
 
-            return self._open_and_cache_session_db(get_hermes_home())
+            return self._checked_session_db(self._open_and_cache_session_db(get_hermes_home()))
         except Exception as e:
-            logger.debug("SessionDB unavailable for API server: %s", e)
+            from gateway.session_db_recovery import requires_postgres, RequiredSessionStoreUnavailable
+            if requires_postgres():
+                raise RequiredSessionStoreUnavailable('Required session storage is unavailable') from None
+            logger.debug("SessionDB unavailable for API server: %s", type(e).__name__)
             return None
 
     async def _ensure_session_db_async(self):
@@ -2790,7 +2800,7 @@ class APIServerAdapter(BasePlatformAdapter):
         concurrent construction for the same home.
         """
         if self._session_db is not None:
-            return self._session_db
+            return self._checked_session_db(self._session_db)
         try:
             from hermes_constants import get_hermes_home
 
@@ -2799,17 +2809,20 @@ class APIServerAdapter(BasePlatformAdapter):
             with self._session_db_cache_lock:
                 cached = self._session_dbs.get(key)
             if cached is not None:
-                return cached
+                return self._checked_session_db(cached)
             if self._session_db_lock is None:
                 self._session_db_lock = asyncio.Lock()
             async with self._session_db_lock:
                 with self._session_db_cache_lock:
                     cached = self._session_dbs.get(key)
                 if cached is not None:
-                    return cached
-                return await asyncio.to_thread(self._open_and_cache_session_db, home)
+                    return self._checked_session_db(cached)
+                return self._checked_session_db(await asyncio.to_thread(self._open_and_cache_session_db, home))
         except Exception as e:
-            logger.debug("SessionDB unavailable for API server: %s", e)
+            from gateway.session_db_recovery import requires_postgres, RequiredSessionStoreUnavailable
+            if requires_postgres():
+                raise RequiredSessionStoreUnavailable('Required session storage is unavailable') from None
+            logger.debug("SessionDB unavailable for API server: %s", type(e).__name__)
             return None
 
     # ------------------------------------------------------------------
@@ -4650,7 +4663,10 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             return await asyncio.to_thread(db.get_messages_as_conversation, session_id)
         except Exception as exc:
-            logger.warning("Failed to load session history for %s: %s", session_id, exc)
+            from gateway.session_db_recovery import requires_postgres, RequiredSessionStoreUnavailable
+            if requires_postgres():
+                raise RequiredSessionStoreUnavailable('Required session history is unavailable') from None
+            logger.warning("Failed to load session history: %s", type(exc).__name__)
             return []
 
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":

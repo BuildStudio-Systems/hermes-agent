@@ -4916,6 +4916,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception:
             logger.debug("Could not close a SessionDB connection", exc_info=True)
 
+    def __new__(cls, db_path: Path = None, read_only: bool = False):
+        if cls is SessionDB:
+            path = db_path or _default_db_path()
+            _ensure_test_isolation(path)
+            from hermes_cli.postgres_runtime import configuration
+            if configuration('sessions', path) is not None:
+                from hermes_state_postgres import PostgresSessionDB
+                # Return an uninitialized instance: Python calls the selected
+                # subclass initializer exactly once with the original args.
+                return object.__new__(PostgresSessionDB)
+        return object.__new__(cls)
+
     def __init__(self, db_path: Path = None, read_only: bool = False):
         self.db_path = db_path or _default_db_path()
         # Fail hard (before any connection/pragma/mkdir) if a pytest-context
@@ -4926,7 +4938,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # ledgers between PostgreSQL and the retained SQLite snapshot.
         from hermes_cli.postgres_runtime import configuration as storage_configuration
         if storage_configuration('sessions', self.db_path) is not None:
-            raise RuntimeError('PostgreSQL session activation awaits final cutover readiness')
+            raise RuntimeError('Session storage selection changed while opening the database')
         self.read_only = read_only
 
         self._lock = threading.Lock()
@@ -15804,7 +15816,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     vacuum_due = (now - float(last_vacuum_raw)) >= min_vacuum_interval_days * 86400
                 except (TypeError, ValueError):
                     vacuum_due = True
-            if vacuum and pruned > 0 and vacuum_due:
+            if vacuum and not getattr(self, 'is_postgres', False) and pruned > 0 and vacuum_due:
                 try:
                     self.vacuum()
                     result["vacuumed"] = True

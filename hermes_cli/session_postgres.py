@@ -2,7 +2,7 @@
 
 Handles do not retain a server connection while idle. SQL dialect differences
 belong at the caller; this module only binds qmark parameters and adapts rows.
-Activation remains blocked in SessionDB until every transcript consumer is ported.
+SessionDB selects this engine only for an explicitly provisioned profile.
 """
 from __future__ import annotations
 
