@@ -1759,6 +1759,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self._file_delivery_enabled: bool = _coerce_request_bool(
             file_delivery.get("enabled"), default=False
         )
+        self._file_delivery_snapshot_files: bool = _coerce_request_bool(
+            file_delivery.get("snapshot_files"), default=False
+        )
         self._file_delivery_public_base_url: str = str(
             file_delivery.get("public_base_url") or ""
         ).strip().rstrip("/")
@@ -2524,6 +2527,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     hermes_home / "cache" / "chat-files" / "index.sqlite3",
                     ttl_seconds=self._file_delivery_ttl_seconds,
                     max_bytes=self._file_delivery_max_bytes,
+                    snapshot_root=(hermes_home / "cache" / "documents" / "deliveries")
+                    if self._file_delivery_snapshot_files else None,
                 )
                 self._chat_file_stores[store_key] = store
         return store

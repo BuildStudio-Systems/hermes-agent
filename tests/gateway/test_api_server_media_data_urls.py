@@ -36,6 +36,37 @@ _PNG_BYTES = base64.b64decode(
 )
 
 
+@pytest.mark.asyncio
+async def test_configured_snapshot_delivery_uses_central_copy(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _enable_strict_test_media(monkeypatch, tmp_path)
+    source = tmp_path / "workspace-report.pdf"
+    source.write_bytes(b"%PDF-central-snapshot")
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={
+        "key": "test-api-key",
+        "file_delivery": {"enabled": True, "snapshot_files": True,
+                          "public_base_url": "/api/v1/agent-files"},
+    }))
+    chat = "11111111-1111-4111-8111-111111111111"
+    link = adapter._resolve_media_for_delivery(f"MEDIA:{source}", owner_id="user-1", chat_id=chat)
+    artifact_id = re.search(r"/([0-9a-f]{32})/", link).group(1)
+    stored = adapter._get_chat_file_store().resolve(artifact_id, owner_id="user-1")
+    assert Path(stored.path).is_relative_to(tmp_path / "cache/documents/deliveries")
+    assert stored.filename == source.name and stored.chat_id == chat
+    source.unlink()
+    app = web.Application()
+    app.router.add_get("/v1/files/{artifact_id}", adapter._handle_chat_file_download)
+    async with TestClient(TestServer(app)) as client:
+        headers = {"Authorization": "Bearer test-api-key", "X-BuildStudio-User-Id": "user-1"}
+        response = await client.get(f"/v1/files/{artifact_id}", headers=headers)
+        assert response.status == 200
+        assert await response.read() == b"%PDF-central-snapshot"
+        assert "no-store" in response.headers["Cache-Control"]
+        headers["X-BuildStudio-User-Id"] = "other"
+        assert (await client.get(f"/v1/files/{artifact_id}", headers=headers)).status == 404
+        assert (await client.get(f"/v1/files/{artifact_id}")).status == 401
+
+
 class TestResolveMediaToDataUrls(unittest.TestCase):
     def _write_png(self, tmpdir_name="hermes_media_test"):
         import tempfile

@@ -1,6 +1,7 @@
 """Persistent metadata registry for files linked from API chat responses.
 
-The file bytes stay in their original, already validated location.  Only a
+File bytes stay in their validated location, or in a configured durable snapshot
+directory when execution workspaces must remain local. Only a
 random identifier crosses the API boundary; the local path is kept in a small
 profile-scoped database index. Callers must validate the path
 both before :meth:`publish` and after :meth:`resolve`.
@@ -73,10 +74,12 @@ class ChatFileArtifactStore:
         *,
         ttl_seconds: int = DEFAULT_CHAT_FILE_TTL_SECONDS,
         max_bytes: int = DEFAULT_CHAT_FILE_MAX_BYTES,
+        snapshot_root: Path | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.ttl_seconds = max(60, int(ttl_seconds))
         self.max_bytes = max(1, int(max_bytes))
+        self.snapshot_root = Path(snapshot_root) if snapshot_root is not None else None
         from hermes_cli.postgres_runtime import configuration
         self._postgres_settings = configuration("artifacts", self.db_path)
         if self._postgres_settings is not None:
@@ -171,9 +174,18 @@ class ChatFileArtifactStore:
                 f"File exceeds the {self.max_bytes}-byte delivery limit"
             )
 
+        filename = source.name
+        if self.snapshot_root is not None:
+            from gateway.delivery_snapshots import snapshot_file
+            source = snapshot_file(
+                source, self.snapshot_root, owner=owner_id, chat=chat_id,
+                limit=self.max_bytes,
+            )
+            stat = source.stat()
+
         now = time.time()
         expires_at = now + self.ttl_seconds
-        content_type = mimetypes.guess_type(source.name)[0] or "application/octet-stream"
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
         with closing(self._connect()) as connection:
             with connection:
@@ -203,7 +215,7 @@ class ChatFileArtifactStore:
                         owner_id,
                         chat_id,
                         str(source),
-                        source.name,
+                        filename,
                         content_type,
                         stat.st_size,
                         stat.st_mtime_ns,
@@ -215,7 +227,7 @@ class ChatFileArtifactStore:
             artifact_id=artifact_id,
             owner_id=owner_id,
             path=str(source),
-            filename=source.name,
+            filename=filename,
             content_type=content_type,
             size_bytes=stat.st_size,
             mtime_ns=stat.st_mtime_ns,
