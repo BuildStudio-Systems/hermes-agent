@@ -31,3 +31,11 @@ them.
 Validation includes concurrent duplicate publication, original-file removal,
 owner/chat separation, source size limits, failure cleanup, changed copies,
 symlink rejection, SMB timestamp refresh and native authenticated HTTP delivery.
+# Event-loop isolation
+
+API response finalization and streaming MEDIA resolution dispatch potentially
+blocking file copies and PostgreSQL publication to worker threads. Ordinary
+text chunks remain on the event loop. Request owner and chat ContextVars follow
+the worker, and stream ordering and path redaction remain unchanged. Session
+agent delta callbacks already execute in the agent worker; their final flush
+uses the asynchronous resolver as well.

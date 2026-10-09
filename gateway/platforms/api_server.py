@@ -1391,6 +1391,18 @@ class _StreamingMediaResolver:
         self._holding_media = False
         return [self._resolver(pending)]
 
+    async def feed_async(self, text: str) -> List[str]:
+        # Keep ordinary token streaming on the event loop. A complete MEDIA
+        # line can copy a large SMB file and write its PostgreSQL index.
+        if self._holding_media or self._MARKER in (self._buffer + text).lower():
+            return await asyncio.to_thread(self.feed, text)
+        return self.feed(text)
+
+    async def finish_async(self) -> List[str]:
+        if self._MARKER in self._buffer.lower():
+            return await asyncio.to_thread(self.finish)
+        return self.finish()
+
 
 def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
     """Redact API-bound error text before it crosses the HTTP boundary."""
@@ -2610,6 +2622,12 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             logger.exception("Could not resolve MEDIA tags for API delivery")
             return _redact_unresolved_media_directives(text)
+
+    async def _resolve_media_for_delivery_async(self, text: str) -> str:
+        if text and "media:" in text.lower():
+            # to_thread preserves request ContextVars, including owner/chat.
+            return await asyncio.to_thread(self._resolve_media_for_delivery, text)
+        return self._resolve_media_for_delivery(text)
 
     async def _handle_chat_file_download(
         self, request: "web.Request"
@@ -5132,7 +5150,7 @@ class APIServerAdapter(BasePlatformAdapter):
             **agent_overrides,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
-        final_response = self._resolve_media_for_delivery(result.get("final_response", "") if isinstance(result, dict) else "")
+        final_response = await self._resolve_media_for_delivery_async(result.get("final_response", "") if isinstance(result, dict) else "")
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
@@ -5310,12 +5328,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     confirmed_runtime_lock=lock_active,
                     **agent_overrides,
                 )
-                for content in media_stream.finish():
+                for content in await media_stream.finish_async():
                     _enqueue(
                         "assistant.delta",
                         {"message_id": message_id, "delta": content},
                     )
-                final_response = self._resolve_media_for_delivery(result.get("final_response", "") if isinstance(result, dict) else "")
+                final_response = await self._resolve_media_for_delivery_async(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
                 effective_runtime = {}
@@ -5845,7 +5863,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = self._resolve_media_for_delivery(result.get("final_response") or "")
+        final_response = await self._resolve_media_for_delivery_async(result.get("final_response") or "")
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
         completed = bool(result.get("completed", True))
@@ -5991,7 +6009,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__monitor_outcome__":
                     await response.write(_sse_frame(item[1], event="buildstudio.monitor.outcome"))
                 else:
-                    for content in media_stream.feed(str(item)):
+                    for content in await media_stream.feed_async(str(item)):
                         await _emit_content(content)
                 return time.monotonic()
 
@@ -6024,7 +6042,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 last_activity = await _emit(delta)
 
-            for content in media_stream.finish():
+            for content in await media_stream.finish_async():
                 await _emit_content(content)
 
             # Get usage from completed agent. The agent can fail two ways
@@ -6336,7 +6354,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
 
             async def _emit_text_delta(delta_text: str) -> None:
-                for content in media_stream.feed(delta_text):
+                for content in await media_stream.feed_async(delta_text):
                     await _emit_resolved_text_delta(content)
 
             async def _emit_tool_started(payload: Dict[str, Any]) -> str:
@@ -6554,7 +6572,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.error("Error running agent for streaming responses: %s", e, exc_info=True)
                 agent_error = _redact_api_error_text(e)
 
-            for content in media_stream.finish():
+            for content in await media_stream.finish_async():
                 await _emit_resolved_text_delta(content)
 
             # Close the message item if it was opened
@@ -7001,7 +7019,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = self._resolve_media_for_delivery(result.get("final_response", ""))
+        final_response = await self._resolve_media_for_delivery_async(result.get("final_response", ""))
         if isinstance(result, dict):
             result = dict(result)
             result["final_response"] = final_response
