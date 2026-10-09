@@ -2643,15 +2643,21 @@ class APIServerAdapter(BasePlatformAdapter):
         if not owner_id:
             raise web.HTTPNotFound()
 
-        try:
+        def resolve_download():
+            # Registry initialization/queries and strict media checks can touch
+            # PostgreSQL and network storage. Keep both off the event loop;
+            # to_thread preserves the selected profile's ContextVars.
             artifact = self._get_chat_file_store().resolve(
                 request.match_info.get("artifact_id", ""), owner_id=owner_id
             )
-        except ChatFileArtifactNotFound:
-            raise web.HTTPNotFound()
+            safe_path = validate_media_delivery_path(artifact.path)
+            if not safe_path:
+                raise ChatFileArtifactNotFound("Artifact path is unavailable")
+            return artifact, safe_path
 
-        safe_path = validate_media_delivery_path(artifact.path)
-        if not safe_path:
+        try:
+            artifact, safe_path = await asyncio.to_thread(resolve_download)
+        except ChatFileArtifactNotFound:
             raise web.HTTPNotFound()
 
         ascii_name = re.sub(r"[^A-Za-z0-9._-]", "_", artifact.filename) or "download"

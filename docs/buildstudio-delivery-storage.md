@@ -39,3 +39,12 @@ text chunks remain on the event loop. Request owner and chat ContextVars follow
 the worker, and stream ordering and path redaction remain unchanged. Session
 agent delta callbacks already execute in the agent worker; their final flush
 uses the asynchronous resolver as well.
+## Download responsiveness follow-up 2026-10-09
+
+Authenticated download lookup now dispatches registry initialization, PostgreSQL
+resolution and strict media path validation to a worker thread. A slow storage
+operation therefore does not block unrelated requests on the API event loop.
+The request profile ContextVars are preserved. Authentication and owner checks
+still precede storage access; chat binding, no-store and range delivery remain
+unchanged. Two stalled-storage regressions fail against the previous handler
+and pass with this change; the eight-file related suite passes 304 tests.
